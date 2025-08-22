@@ -1,309 +1,300 @@
-# offline_demo_strong_uplift.py
+#!/usr/bin/env python3
 """
-Self-contained offline demo that produces a clear uplift for a context-aware LinUCB over Uniform.
-Run:
-    python3 offline_demo_strong_uplift.py
-Requires:
-    numpy, sklearn, matplotlib, joblib, torch, obp
+offline_train_eval.py
+
+Single-file offline pipeline for demo:
+ - synthetic OBP bandit data
+ - 10-day decayed short histories -> true long-term L_true
+ - RF to predict L_true from context + first K days short features
+ - learn alpha (scalar) and beta (3-vector) to form composite reward:
+       r_comp = alpha * (short_features · beta) + (1-alpha) * L_hat
+ - build LinUCB sufficient stats from logged data using r_comp
+ - build per-action reward regressor r_hat(x,a) to compute expected-per-round rewards for policies
+ - run OPE (IPS / SNIPS / DR) via obp
+ - plot cumulative expected reward for uniform vs linucb
 """
 import os
 import json
+import time
+import math
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.ensemble import RandomForestRegressor
-from joblib import dump
+from sklearn.model_selection import train_test_split
 import torch
-from obp.ope import OffPolicyEvaluation, InverseProbabilityWeighting, SelfNormalizedInverseProbabilityWeighting, DoublyRobust
 from obp.dataset import SyntheticBanditDataset
-from datetime import datetime, timezone
+from obp.ope import OffPolicyEvaluation, InverseProbabilityWeighting, SelfNormalizedInverseProbabilityWeighting, DoublyRobust
 
-np.random.seed(42)
-torch.manual_seed(42)
-
-OUTDIR = "outputs_strong_demo"
-os.makedirs(OUTDIR, exist_ok=True)
-
-# --- DEMO CONFIG: tune these to make uplift larger/smaller ---
-N_ROUNDS = 5000         # more data -> easier to learn
+# -----------------------
+# CONFIG (tweak for demo)
+# -----------------------
+SEED = 42
+N_ROUNDS = 2000         # total synthetic logged rounds
 N_ACTIONS = 10
-DIM = 12
-SHORT_DAYS = 3          # short-term features length
-NOISE = 0.03
-RF_ESTIMATORS = 300
-LINUCb_ALPHA = 0.2      # exploration factor when computing LinUCB scores for target policy
-# -----------------------------------------------------------------
+DIM_CONTEXT = 12
+DAYS = 10               # true long horizon
+K_DAYS = 5              # partial days used for predicting L
+DECAY = 0.95            # decay factor per day
+RF_N_EST = 200
+LINUCB_REG = 1.0
+ALPHA_LIN = 0.1
+RANDOM_STATE = SEED
+OUTPUT_DIR = "outputs"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
 
-def sigmoid(x): return 1/(1+np.exp(-x))
+# -----------------------
+# 1) synthetic bandit data (context + logged action and pscore)
+# -----------------------
+print("[*] Generating synthetic OBP bandit data...")
+ds = SyntheticBanditDataset(n_actions=N_ACTIONS, dim_context=DIM_CONTEXT, reward_type="continuous", random_state=SEED)
+bf = ds.obtain_batch_bandit_feedback(n_rounds=N_ROUNDS)
+# bf contains 'context', 'action', 'pscore' among others
+X = bf["context"].astype(float)            # shape (N, DIM_CONTEXT)
+A = bf["action"].astype(int)               # shape (N,)
+P = bf.get("pscore", None)
+if P is None:
+    P = np.ones_like(A, dtype=float) / N_ACTIONS
+else:
+    P = np.array(P, dtype=float)
 
-def generate_strong_contextual_data(n_rounds, n_actions, dim, short_days, seed=42):
-    """
-    Generate:
-      - context X (n_rounds x dim)
-      - chosen action A (n_rounds) (from OBP's synthetic logging policy)
-      - logging propensities P (n_rounds)
-      - short-term per-round vector SE (n_rounds x short_days)
-      - true long-term L_true that *depends on action and context*
-    Key idea: each action has its own weight vector; best action depends on context.
-    """
-    rng = np.random.default_rng(seed)
-    ds = SyntheticBanditDataset(n_actions=n_actions, dim_context=dim, reward_type="binary", random_state=seed)
-    bf = ds.obtain_batch_bandit_feedback(n_rounds=n_rounds)
-    X = bf["context"]          # shape (n_rounds, dim)
-    A = bf["action"]
-    P = bf["pscore"]
+N = X.shape[0]
+print(f"  n_rounds={N}, n_actions={N_ACTIONS}, dim={DIM_CONTEXT}")
 
-    # short-term features (day-level interactions) - small noise + dependence on action for realism
-    clicks = rng.binomial(1, 0.25, size=n_rounds)
-    revis = rng.binomial(1, 0.18, size=n_rounds)
-    watch = np.clip(rng.normal(0.45, 0.15, size=n_rounds), 0., 1.)
-    SE = np.stack([clicks, revis, watch], axis=1)  # shape (n_rounds, 3)
+# -----------------------
+# 2) synthesize 10-day short histories and L_true (decayed cumulative)
+# -----------------------
+print("[*] Synthesizing 10-day short-term histories and true long-term (L_true)...")
+rng = np.random.default_rng(SEED + 1)
 
-    # Create arm-specific weight vectors so optimal action depends on context
-    arm_weights = rng.normal(0, 1.0, size=(n_actions, dim))
-    # amplify structure so linear model strong: multiply some arms by factor
-    for i in range(n_actions):
-        arm_weights[i] *= (1.0 + 0.2 * (i % 3))
+# We'll create per-day short features: (click, revisit, watch_time) per day
+SE_days = np.zeros((N, DAYS, 3), dtype=float)
+for day in range(DAYS):
+    # make probabilities depend a tiny bit on context first feature to create signal
+    base_click_prob = 0.20 + 0.05 * np.tanh(X[:, 0] * 0.5)
+    base_revisit_prob = 0.10 + 0.04 * np.tanh(X[:, 1] * 0.5)
+    # randomness per day
+    clicks = rng.binomial(1, np.clip(base_click_prob + rng.normal(0, 0.03, size=N), 0, 1))
+    revisits = rng.binomial(1, np.clip(base_revisit_prob + rng.normal(0, 0.02, size=N), 0, 1))
+    watch = np.clip(rng.normal(0.5 + 0.02 * (day / (DAYS-1)), 0.12, size=N), 0, 1)
+    SE_days[:, day, 0] = clicks
+    SE_days[:, day, 1] = revisits
+    SE_days[:, day, 2] = watch
 
-    # Make true long-term L_true depend on context·arm_weights[action] + short-term decayed sum
-    # Also add a nonlinearity (sigmoid) to make reward in [0,1].
-    ctx_effect = np.array([ (X[i] @ arm_weights[A[i]]) for i in range(n_rounds) ])
-    # scale to reasonable range
-    ctx_effect = (ctx_effect - ctx_effect.mean()) / max(1e-6, ctx_effect.std())
-    # Short-term cumulative with decay; weight for short-term larger so composite is meaningful
-    decay = np.array([0.6, 0.3, 0.1])  # decayed days -> strong immediate influence
-    se_score = (SE * decay).sum(axis=1)
-    # Build L_true: sigmoid of linear mixture
-    L_true = sigmoid(1.2 * ctx_effect + 1.6 * se_score + rng.normal(0, NOISE, size=n_rounds))
-    # Clip to [0,1]
-    L_true = np.clip(L_true, 0.0, 1.0)
+# daily score = weighted short engagement (these weights are internal design choices)
+day_weights = np.array([0.35, 0.25, 0.40])  # click, revisit, watch
+day_scores = (SE_days * day_weights.reshape(1, 1, 3)).sum(axis=2)  # shape (N, DAYS)
 
-    return {
-        "context": X, "action": A, "pscore": P, "short": SE, "long_true": L_true, "arm_weights": arm_weights
-    }
+# decayed cumulative true long-term (L_true)
+decay_powers = np.array([DECAY ** t for t in range(DAYS)])
+L_true = (day_scores * decay_powers.reshape(1, DAYS)).sum(axis=1)   # shape (N,)
+# normalize to [0,1]
+L_true = (L_true - L_true.min()) / max(1e-9, (L_true.max() - L_true.min()))
 
-def fit_rf_predictor(X_ctx, SE, L_true):
-    """
-    Train RF regressor to predict L_true from context + short features.
-    Returns fitted rf and predictions for full X.
-    """
-    Xrf = np.hstack([X_ctx, SE])
-    rf = RandomForestRegressor(n_estimators=RF_ESTIMATORS, min_samples_leaf=3, n_jobs=-1, random_state=42)
-    rf.fit(Xrf, L_true)
-    preds = rf.predict(Xrf)
-    return rf, preds
+print("  Synth done. L_true range:", float(L_true.min()), float(L_true.max()))
 
+# short-term features we will use for composite reward:
+# use aggregated first K_DAYS features (mean across K days)
+SE_first_k = SE_days[:, :K_DAYS, :].mean(axis=1)   # shape (N, 3)
 
+# -----------------------
+# 3) Train RF to predict L_true from (context + first K days short features)
+# -----------------------
+print(f"[*] Training RF to predict L_true using context + first {K_DAYS} days short features...")
+Xrf = np.hstack([X, SE_first_k])  # shape (N, DIM + 3)
+Xrf_train, Xrf_test, y_train, y_test = train_test_split(Xrf, L_true, test_size=0.2, random_state=SEED)
+rf = RandomForestRegressor(n_estimators=RF_N_EST, min_samples_leaf=3, n_jobs=-1, random_state=SEED)
+rf.fit(Xrf_train, y_train)
+r2 = rf.score(Xrf_test, y_test)
+print("  RF trained. test R^2 (approx):", r2)
 
-def learn_alpha_beta(SE_train, Lhat_train, Ltrue_train, epochs=400, lr=0.02, device=None):
-    """
-    Fit scalar alpha in (0,1) and softmax(beta) weights over short features to minimize MSE:
-      r_comp = alpha * (SE @ beta) + (1-alpha) * Lhat
-    Returns (alpha_float, beta_numpy_array)
-    Ensures all tensors are float32 to avoid dtype mismatch errors.
-    """
-    # ensure numpy arrays and float32
-    SE_train = np.asarray(SE_train, dtype=np.float32)
-    Lhat_train = np.asarray(Lhat_train, dtype=np.float32)
-    Ltrue_train = np.asarray(Ltrue_train, dtype=np.float32)
+# predicted L_hat (for all rounds using available first-K-days)
+L_hat = rf.predict(Xrf)   # numpy float64
 
-    # device (cpu is fine for demo)
-    if device is None:
-        device = torch.device("cpu")
+# -----------------------
+# 4) learn alpha and beta (composite params) via small torch fit
+#    target: alpha * (SE_first_k @ beta) + (1-alpha) * L_hat  ~ L_true
+# -----------------------
+print("[*] Learning composite parameters alpha and beta via small gradient fit...")
+# use a subset for stable fit (we have L_true for synthetic data so we can train on all)
+mask = np.arange(N)
+se_t = torch.tensor(SE_first_k[mask], dtype=torch.float32)           # (N,3)
+lt_hat_t = torch.tensor(L_hat[mask].astype(np.float32), dtype=torch.float32)  # (N,)
+lt_true_t = torch.tensor(L_true[mask].astype(np.float32), dtype=torch.float32) # (N,)
 
-    se_t = torch.from_numpy(SE_train).to(dtype=torch.float32, device=device)       # (n_samples, n_short)
-    lt_hat_t = torch.from_numpy(Lhat_train).to(dtype=torch.float32, device=device) # (n_samples,)
-    lt_t = torch.from_numpy(Ltrue_train).to(dtype=torch.float32, device=device)    # (n_samples,)
+# initialize raw params
+a_raw = torch.tensor(0.0, requires_grad=True, dtype=torch.float32)
+b_raw = torch.tensor([0.34, 0.22, 0.44], requires_grad=True, dtype=torch.float32)
+opt = torch.optim.Adam([a_raw, b_raw], lr=0.02)
 
-    # initialize learnable params as float32
-    a_raw = torch.tensor(0.0, dtype=torch.float32, requires_grad=True, device=device)
-    b_raw = torch.tensor(np.ones(SE_train.shape[1], dtype=np.float32), dtype=torch.float32,
-                         requires_grad=True, device=device)
+for epoch in range(400):
+    opt.zero_grad()
+    alpha = torch.sigmoid(a_raw)                              # scalar in (0,1)
+    beta = torch.nn.functional.softmax(b_raw, dim=0)          # 3-vector sum=1
+    r_short = torch.matmul(se_t, beta)                        # (N,)
+    r_comp = alpha * r_short + (1.0 - alpha) * lt_hat_t       # (N,)
+    loss = torch.mean((r_comp - lt_true_t) ** 2) + 1e-4 * (alpha - 0.5) ** 2
+    loss.backward()
+    opt.step()
+    # small early stop-ish (optional)
+    if epoch % 100 == 0:
+        pass
 
-    opt = torch.optim.Adam([a_raw, b_raw], lr=lr)
+alpha_val = float(torch.sigmoid(a_raw).item())
+beta_val = torch.softmax(b_raw.detach(), dim=0).numpy()
+print("[*] learned alpha =", alpha_val, " beta =", beta_val)
 
-    for _ in range(epochs):
-        opt.zero_grad()
-        alpha = torch.sigmoid(a_raw)                           # scalar float32
-        beta = torch.nn.functional.softmax(b_raw, dim=0)       # (n_short,) float32
+# -----------------------
+# 5) Composite reward R_comp for ALL rounds (backfill)
+# -----------------------
+print("[*] Building composite reward (backfill) for all rounds...")
+r_short_all = SE_first_k @ beta_val   # numpy float64
+R_comp = np.clip(alpha_val * r_short_all + (1 - alpha_val) * L_hat, 0.0, 1.0)   # (N,)
 
-        # r_short: (n_samples,) = SE (n x k) @ beta (k,)
-        r_short = se_t.matmul(beta)
+# -----------------------
+# 6) Build LinUCB sufficient stats (A, b) from logged data (x, a, R_comp)
+# -----------------------
+print("[*] Building LinUCB sufficient stats (A, b) from synthetic data...")
+d = DIM_CONTEXT
+A_mats = np.stack([np.eye(d) * LINUCB_REG for _ in range(N_ACTIONS)])   # (n_actions, d, d)
+b_vecs = np.zeros((N_ACTIONS, d), dtype=float)
+counts = np.zeros(N_ACTIONS, dtype=int)
+for x, a, r in zip(X, A, R_comp):
+    A_mats[a] += np.outer(x, x)
+    b_vecs[a] += r * x
+    counts[a] += 1
 
-        # composite reward per-sample
-        r_comp = alpha * r_short + (1.0 - alpha) * lt_hat_t
-
-        loss = torch.mean((r_comp - lt_t) ** 2)
-        loss.backward()
-        opt.step()
-
-    alpha_val = float(torch.sigmoid(a_raw).item())
-    beta_val = torch.softmax(b_raw.detach(), dim=0).cpu().numpy().astype(float)
-    return alpha_val, beta_val
-
-def build_linucb_stats(X, A, R_comp, n_actions, d, reg=1.0):
-    A_mats = np.stack([np.eye(d) * reg for _ in range(n_actions)])
-    b_vecs = np.zeros((n_actions, d))
-    counts = np.zeros(n_actions, dtype=int)
-    for x, a, r in zip(X, A, R_comp):
-        # r expected to be scalar in [0,1]
-        A_mats[a] += np.outer(x, x)
-        b_vecs[a] += r * x
-        counts[a] += 1
-    return A_mats, b_vecs, counts
-
-def linucb_action_dist_from_stats(A_mats, b_vecs, alpha_lin, X_ctx):
-    """
-    For each context, compute LinUCB score for each action and return action-distributions (softmax over scores).
-    Returns array of shape (n_rounds, n_actions).
-    """
-    n_actions = len(A_mats)
-    n_rounds = X_ctx.shape[0]
-    ad = np.zeros((n_rounds, n_actions))
-    d = X_ctx.shape[1]
-    for i, x in enumerate(X_ctx):
-        xcol = x.reshape(d, 1)
-        sc = np.zeros(n_actions)
-        for a in range(n_actions):
-            Ainv = np.linalg.inv(A_mats[a])
-            theta = Ainv @ b_vecs[a].reshape(d, 1)
+# -----------------------
+# 7) build candidate policy (linucb) action distribution per-round (n_rounds, n_actions)
+# -----------------------
+print("[*] Computing target policy distributions (uniform and linucb)...")
+def linucb_action_dist_for(Amats, Bvecs, contexts, alpha_lin=ALPHA_LIN):
+    n_rounds = contexts.shape[0]
+    out = np.zeros((n_rounds, N_ACTIONS), dtype=float)
+    for i, x in enumerate(contexts):
+        xcol = x.reshape(d,1)
+        sc = np.zeros(N_ACTIONS, dtype=float)
+        for a in range(N_ACTIONS):
+            Ainv = np.linalg.inv(Amats[a])
+            theta = Ainv @ Bvecs[a].reshape(d,1)
             mean = float((theta.T @ xcol).item())
             std = float(np.sqrt((xcol.T @ Ainv @ xcol).item()))
             sc[a] = mean + alpha_lin * std
         ex = np.exp(sc - sc.max())
-        ad[i, :] = ex / ex.sum()
-    return ad
+        probs = ex / ex.sum()
+        out[i, :] = probs
+    return out
 
-def uniform_action_dist(n_rounds, n_actions):
-    return np.ones((n_rounds, n_actions)) / float(n_actions)
+ad_linucb = linucb_action_dist_for(A_mats, b_vecs, X, alpha_lin=ALPHA_LIN)
+ad_uniform = np.ones_like(ad_linucb) / float(N_ACTIONS)   # (N, n_actions)
 
-def run_ope_and_report(bandit_feedback, ad_uniform, ad_linucb):
-    # bandit_feedback is a dict with keys: n_rounds, context, action, reward, pscore
-    ope = OffPolicyEvaluation(bandit_feedback=bandit_feedback,
-                              ope_estimators=[InverseProbabilityWeighting(),
-                                              SelfNormalizedInverseProbabilityWeighting(),
-                                              DoublyRobust()])
-    est_uniform = ope.estimate_policy_values(action_dist=ad_uniform)
-    est_linucb = ope.estimate_policy_values(action_dist=ad_linucb)
+# -----------------------
+# 8) Build bandit_feedback dict expected by obp OPE (2D action_dist — single slot)
+# -----------------------
+print("[*] Preparing bandit_feedback for OPE...")
+# We need: n_rounds, n_actions, context, action, reward, pscore
+bf_for_ope = {
+    "n_rounds": int(N),
+    "n_actions": int(N_ACTIONS),
+    "context": X.astype(float),
+    "action": A.astype(int),
+    "reward": R_comp.astype(float),
+    "pscore": np.where(np.isnan(P), 1.0 / N_ACTIONS, P).astype(float),
+}
 
-    def summarise(name, est):
-        ips = float(est["ipw"])
-        snip = float(est["snip"])
-        dr = float(est["dr"])
-        return f"{name:7s} | IPS={ips:.4f} SNIPS={snip:.4f} DR={dr:.4f}"
+# -----------------------
+# 9) Train per-action reward regressor r_hat(x,a) so we can compute per-round expected reward for plotting
+#    We'll one-hot encode action and train RF to predict R_comp
+# -----------------------
+print("[*] Training per-action reward regressor (context + action_onehot -> R_comp) for plotting expected reward per round...")
+from sklearn.preprocessing import OneHotEncoder
+enc = OneHotEncoder(sparse=False, categories=[np.arange(N_ACTIONS)], handle_unknown='ignore')
+A_onehot = enc.fit_transform(A.reshape(-1,1))  # (N, n_actions)
+X_reg = np.hstack([X, A_onehot])               # (N, d + n_actions)
+Xr_train, Xr_test, yr_train, yr_test = train_test_split(X_reg, R_comp, test_size=0.2, random_state=SEED)
+rf_r = RandomForestRegressor(n_estimators=RF_N_EST, min_samples_leaf=3, n_jobs=-1, random_state=SEED + 1)
+rf_r.fit(Xr_train, yr_train)
+r2_r = rf_r.score(Xr_test, yr_test)
+print("  r_hat reg trained. test R^2:", r2_r)
 
-    print("Running OPE for Uniform and LinUCB...")
-    print("  " + summarise("uniform", est_uniform))
-    print("  " + summarise("linucb", est_linucb))
-    uplift = float(est_linucb["dr"] - est_uniform["dr"])
-    print(f"Estimated uplift (linucb - uniform) by DR = {uplift:.6f}")
-    return est_uniform, est_linucb, uplift
+# predict r_hat for every (x,a) combination -> r_hat_matrix shape (N, n_actions)
+r_hat_matrix = np.zeros((N, N_ACTIONS), dtype=float)
+for i, x in enumerate(X):
+    # build (n_actions, d + n_actions) input where onehot cycles
+    action_oh = np.eye(N_ACTIONS, dtype=float)
+    X_all = np.hstack([np.repeat(x.reshape(1, -1), N_ACTIONS, axis=0), action_oh])
+    preds = rf_r.predict(X_all)   # (n_actions,)
+    r_hat_matrix[i, :] = preds
 
-def plot_cumulative_expected(bandit_feedback, ad_uniform, ad_linucb, out_path):
-    # cumulative expected reward: for each round t, expected reward under policy is sum_a pi_t(a|x_t)*expected_reward(a|x_t)
-    # we approximate expected_reward(a|x) by predicted composite reward r_comp computed earlier in bandit_feedback["reward"]
-    R = np.array(bandit_feedback["reward"])  # reward per logged event (we will use predicted composite)
-    # But we need expected reward for each action at each context - we will reconstruct using LinUCB theta from stats is easier.
-    # For simplicity: compute expected instantaneous value for each logged context as average of policy's distribution dot logged reward.
-    # This is an approximation but fine for demo cumulative curves.
-    n_rounds = bandit_feedback["n_rounds"]
-    # expected instant reward for a policy on logged rounds: sum_a pi(a|x_t) * r_hat_for_a(x_t)
-    # We'll estimate r_hat_for_a(x_t) using logged reward if action==a else use average reward per action.
-    A = np.array(bandit_feedback["action"])
-    # average reward per action (fallback)
-    avg_per_action = {}
-    for a in np.unique(A):
-        mask = (A == a)
-        avg_per_action[a] = float(np.nanmean(R[mask])) if mask.sum() else 0.0
-    # build r_est matrix
-    r_est = np.zeros((n_rounds, bandit_feedback["n_actions"]))
-    for t in range(n_rounds):
-        for a in range(bandit_feedback["n_actions"]):
-            if A[t] == a and not np.isnan(R[t]):
-                r_est[t, a] = R[t]
-            else:
-                r_est[t, a] = avg_per_action.get(a, 0.0)
-    exp_uniform = (ad_uniform * r_est).sum(axis=1)
-    exp_linucb = (ad_linucb * r_est).sum(axis=1)
-    cum_u = np.cumsum(exp_uniform)
-    cum_l = np.cumsum(exp_linucb)
-    plt.figure(figsize=(8,4))
-    plt.plot(cum_u, label="uniform (expected cum reward)")
-    plt.plot(cum_l, label="linucb (expected cum reward)")
-    plt.legend()
-    plt.title("Cumulative expected reward (approx)")
-    plt.tight_layout()
-    plt.savefig(out_path)
-    plt.close()
-    print("Saved cumulative expected reward plot to", out_path)
+# compute per-round expected reward under two policies
+exp_reward_uniform = (ad_uniform * r_hat_matrix).sum(axis=1)
+exp_reward_linucb = (ad_linucb * r_hat_matrix).sum(axis=1)
 
-def main():
-    print("[*] Generating synthetic OBP bandit data...")
-    gen = generate_strong_contextual_data(N_ROUNDS, N_ACTIONS, DIM, SHORT_DAYS, seed=42)
-    X = gen["context"]; A = gen["action"]; P = gen["pscore"]; SE = gen["short"]; L_true = gen["long_true"]
+# cumulative expected reward
+cum_uniform = np.cumsum(exp_reward_uniform)
+cum_linucb = np.cumsum(exp_reward_linucb)
 
-    print("[*] Training RF to predict L_true from context + short features...")
-    rf, Lhat = fit_rf_predictor(X, SE, L_true)
-    # quick quality check
-    from sklearn.metrics import r2_score
-    r2 = r2_score(L_true, Lhat)
-    print(f"  RF trained. test R^2 (approx): {r2:.4f}")
+# -----------------------
+# 10) Run Off-Policy Evaluation via obp
+# -----------------------
+print("[*] Running offline policy evaluation (IPS / SNIPS / DR)...")
+ope = OffPolicyEvaluation(bandit_feedback=bf_for_ope,
+                          ope_estimators=[InverseProbabilityWeighting(),
+                                          SelfNormalizedInverseProbabilityWeighting(),
+                                          DoublyRobust()])
 
-    # learn alpha and beta on a subset (use all here)
-    print("[*] Learning composite parameters alpha and beta via small gradient fit...")
-    alpha, beta = learn_alpha_beta(SE, Lhat, L_true, epochs=400, lr=0.02)
-    print("  learned alpha =", alpha, "beta =", beta)
+res_uniform = ope.estimate_policy_values(action_dist=ad_uniform)
+res_linucb = ope.estimate_policy_values(action_dist=ad_linucb)
 
-    print("[*] Building composite reward r_comp = alpha * (SE @ beta) + (1-alpha) * Lhat ...")
-    R_comp = np.clip(alpha * (SE @ beta) + (1.0 - alpha) * Lhat, 0.0, 1.0)
+def fmt_est(name, estd):
+    return (f"{name:7s} | IPS={estd['ipw']:.4f} SNIPS={estd['snipw']:.4f} DR={estd['dr']:.4f} approx_true={estd.get('ground_truth', float('nan')):.4f}")
 
-    # Build LinUCB from full data using composite reward
-    print("[*] Building LinUCB sufficient stats from synthetic data...")
-    A_mats, b_vecs, counts = build_linucb_stats(X, A, R_comp, N_ACTIONS, DIM, reg=1.0)
+# OBP returns dicts; print basic numbers
+print("  uniform | IPS={:.4f} SNIPS={:.4f} DR={:.4f}".format(float(res_uniform["ipw"]),
+                                                            float(res_uniform["snipw"]),
+                                                            float(res_uniform["dr"])))
+print("  linucb  | IPS={:.4f} SNIPS={:.4f} DR={:.4f}".format(float(res_linucb["ipw"]),
+                                                            float(res_linucb["snipw"]),
+                                                            float(res_linucb["dr"])))
+uplift_dr = float(res_linucb["dr"]) - float(res_uniform["dr"])
+print("[*] Estimated uplift (linucb vs uniform) by DR = {:.6f}".format(uplift_dr))
 
-    # Save a couple artifacts
-    dump(rf, os.path.join(OUTDIR, "rf_demo.joblib"))
-    with open(os.path.join(OUTDIR, "meta.json"), "w") as f:
-        json.dump({"alpha": alpha, "beta": beta.tolist(), "r2_rf": r2, "n_rounds": N_ROUNDS}, f, indent=2)
+# -----------------------
+# 11) Plot cumulative expected reward (from r_hat_matrix approximation)
+# -----------------------
+print("[*] Saving cumulative expected reward plot...")
+plt.figure(figsize=(8,4))
+plt.plot(cum_uniform, label="uniform (expected via r_hat)", linewidth=2)
+plt.plot(cum_linucb, label="linucb (expected via r_hat)", linewidth=2)
+plt.xlabel("round (cumulative)")
+plt.ylabel("cumulative expected reward (approx)")
+plt.legend()
+plt.tight_layout()
+out_path = os.path.join(OUTPUT_DIR, "cum_reward_offline.png")
+plt.savefig(out_path)
+plt.close()
+print("  saved:", out_path)
 
-    # Prepare bandit_feedback dict for OPE (as obp expects)
-    # Use reward = R_comp (we backfill using our composite for offline evaluation)
-    bandit_feedback = {
-        "n_rounds": int(N_ROUNDS),
-        "n_actions": int(N_ACTIONS),
-        "context": X,
-        "action": A,
-        "reward": R_comp,
-        "pscore": P
-    }
+# -----------------------
+# 12) Save summary JSON
+# -----------------------
+summary = {
+    "n_rounds": int(N),
+    "n_actions": int(N_ACTIONS),
+    "dim_context": int(DIM_CONTEXT),
+    "rf_r_test_r2": float(r2_r),
+    "rf_Lhat_test_r2": float(r2),
+    "alpha": float(alpha_val),
+    "beta": beta_val.tolist(),
+    "ope_uniform": {"ipw": float(res_uniform["ipw"]), "snipw": float(res_uniform["snipw"]), "dr": float(res_uniform["dr"])},
+    "ope_linucb": {"ipw": float(res_linucb["ipw"]), "snipw": float(res_linucb["snipw"]), "dr": float(res_linucb["dr"])},
+    "uplift_dr": float(uplift_dr),
+    "timestamp": time.time(),
+}
 
-    print("[*] Computing target policy distributions...")
-    # uniform action-dist
-    ad_uniform = uniform_action_dist(N_ROUNDS, N_ACTIONS)
-    # linucb target action distr from stats (softmax over scores)
-    ad_linucb = linucb_action_dist_from_stats(A_mats, b_vecs, LINUCb_ALPHA, X)
+with open(os.path.join(OUTPUT_DIR, "summary_offline.json"), "w") as f:
+    json.dump(summary, f, indent=2)
 
-    # Run OPE
-    print("[*] Running offline policy evaluation (IPS / SNIPS / DR)...")
-    est_u, est_l, uplift = run_ope_and_report(bandit_feedback, ad_uniform, ad_linucb)
-
-    # Plot cumulative expected reward (approx)
-    out_plot = os.path.join(OUTDIR, "cum_reward_offline.png")
-    plot_cumulative_expected(bandit_feedback, ad_uniform, ad_linucb, out_plot)
-
-    # Save summary
-    summary = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "rf_r2": r2,
-        "alpha": alpha,
-        "beta": beta.tolist(),
-        "ope_uniform": {"ips": float(est_u["ipw"]), "snip": float(est_u["snip"]), "dr": float(est_u["dr"])},
-        "ope_linucb": {"ips": float(est_l["ipw"]), "snip": float(est_l["snip"]), "dr": float(est_l["dr"])},
-        "uplift_dr": uplift
-    }
-    with open(os.path.join(OUTDIR, "summary_offline.json"), "w") as f:
-        json.dump(summary, f, indent=2)
-    print("[*] Summary saved to", os.path.join(OUTDIR, "summary_offline.json"))
-    print("[*] Done.")
-
-if __name__ == "__main__":
-    main()
+print("[*] Summary saved to", os.path.join(OUTPUT_DIR, "summary_offline.json"))
+print("[*] Done.")
