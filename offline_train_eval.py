@@ -92,29 +92,52 @@ def fit_rf_predictor(X_ctx, SE, L_true):
     preds = rf.predict(Xrf)
     return rf, preds
 
-def learn_alpha_beta(SE_train, Lhat_train, Ltrue_train, epochs=400, lr=0.02):
-    """
-    Fit scalar alpha in (0,1) and beta weights over short features (softmax) to minimize MSE:
-      r_comp = alpha * (SE @ beta) + (1-alpha) * Lhat
-    Returns alpha (float) and beta (ndarray).
-    """
-    se_t = torch.tensor(SE_train, dtype=torch.float32)
-    lt_hat_t = torch.tensor(Lhat_train, dtype=torch.float32)
-    lt_t = torch.tensor(Ltrue_train, dtype=torch.float32)
 
-    a_raw = torch.tensor(0.0, requires_grad=True)
-    b_raw = torch.tensor(np.ones(SE_train.shape[1], dtype=float), requires_grad=True)
+
+def learn_alpha_beta(SE_train, Lhat_train, Ltrue_train, epochs=400, lr=0.02, device=None):
+    """
+    Fit scalar alpha in (0,1) and softmax(beta) weights over short features to minimize MSE:
+      r_comp = alpha * (SE @ beta) + (1-alpha) * Lhat
+    Returns (alpha_float, beta_numpy_array)
+    Ensures all tensors are float32 to avoid dtype mismatch errors.
+    """
+    # ensure numpy arrays and float32
+    SE_train = np.asarray(SE_train, dtype=np.float32)
+    Lhat_train = np.asarray(Lhat_train, dtype=np.float32)
+    Ltrue_train = np.asarray(Ltrue_train, dtype=np.float32)
+
+    # device (cpu is fine for demo)
+    if device is None:
+        device = torch.device("cpu")
+
+    se_t = torch.from_numpy(SE_train).to(dtype=torch.float32, device=device)       # (n_samples, n_short)
+    lt_hat_t = torch.from_numpy(Lhat_train).to(dtype=torch.float32, device=device) # (n_samples,)
+    lt_t = torch.from_numpy(Ltrue_train).to(dtype=torch.float32, device=device)    # (n_samples,)
+
+    # initialize learnable params as float32
+    a_raw = torch.tensor(0.0, dtype=torch.float32, requires_grad=True, device=device)
+    b_raw = torch.tensor(np.ones(SE_train.shape[1], dtype=np.float32), dtype=torch.float32,
+                         requires_grad=True, device=device)
+
     opt = torch.optim.Adam([a_raw, b_raw], lr=lr)
+
     for _ in range(epochs):
         opt.zero_grad()
-        alpha = torch.sigmoid(a_raw)
-        beta = torch.nn.functional.softmax(b_raw, dim=0)
-        r_short = se_t @ beta
+        alpha = torch.sigmoid(a_raw)                           # scalar float32
+        beta = torch.nn.functional.softmax(b_raw, dim=0)       # (n_short,) float32
+
+        # r_short: (n_samples,) = SE (n x k) @ beta (k,)
+        r_short = se_t.matmul(beta)
+
+        # composite reward per-sample
         r_comp = alpha * r_short + (1.0 - alpha) * lt_hat_t
-        loss = torch.mean((r_comp - lt_t)**2)
-        loss.backward(); opt.step()
+
+        loss = torch.mean((r_comp - lt_t) ** 2)
+        loss.backward()
+        opt.step()
+
     alpha_val = float(torch.sigmoid(a_raw).item())
-    beta_val = torch.softmax(b_raw.detach(), dim=0).numpy()
+    beta_val = torch.softmax(b_raw.detach(), dim=0).cpu().numpy().astype(float)
     return alpha_val, beta_val
 
 def build_linucb_stats(X, A, R_comp, n_actions, d, reg=1.0):
