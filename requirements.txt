@@ -1,0 +1,12 @@
+flask
+sqlalchemy
+psycopg2-binary
+joblib
+numpy
+scikit-learn
+torch
+obp
+requests
+apscheduler
+python-dotenv
+pandas

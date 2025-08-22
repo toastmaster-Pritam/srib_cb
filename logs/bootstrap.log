@@ -1,0 +1,3 @@
+[bootstrap] Generating synthetic bandit logs (demo)...
+[bootstrap] learned alpha 0.10684255510568619 beta [0.21731314 0.36696807 0.4157188 ]
+[bootstrap] Created linucb version: 39 with 50/50 allocation
