@@ -1,19 +1,154 @@
-[*] Generating synthetic OBP bandit data...
-  n_rounds=2000, n_actions=10, dim=12
-[*] Synthesizing 10-day short-term histories and true long-term (L)...
-[*] Training RF to predict L_true using context + first 5 days short features...
-  RF trained. test R^2 (approx): 0.4552099214552878
-[*] Learning composite parameters alpha and beta via small gradient fit...
-  learned alpha = 0.06665080785751343 beta = [0.23251136 0.27525592 0.4922327 ]
-[*] Building LinUCB sufficient stats (A, b) from synthetic data...
-[*] Computing target policy distributions...
-[*] Running offline policy evaluation (IPS / SNIPS / DR)...
-  uniform | IPS=0.3792 SNIPS=0.3792 DR=0.3792 approx_true=0.3792
-  linucb  | IPS=0.3860 SNIPS=0.3794 DR=0.3792 approx_true=0.3792
-[*] Estimated uplift (linucb vs uniform) by DR = -0.000000
-[*] Saving cumulative expected reward plot...
-  saved: outputs/cum_reward_offline.png
-/home/pritam/obp/offline_train_eval.py:273: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
-  "timestamp": datetime.utcnow().isoformat() + "Z"
-[*] Summary saved to outputs/summary_offline.json
-[*] Done.
+from vowpalwabbit import pyvw
+import vowpalwabbit
+from typing import List,Tuple,Optional
+import random
+
+
+def to_vw_example_format(shared_ns:str,actions:List[str],cb_label:Optional[Tuple[int,float,float]]=None)->str:
+    lines=[]
+    lines.append(f"shared {shared_ns}")
+    for idx,a in enumerate(actions):
+        if cb_label is not None and idx == cb_label[0]:
+            lines.append(f"0:{cb_label[1]:.6f}:{cb_label[2]:.6f} {a}")
+        else:
+            lines.append(a)
+    return "\n".join(lines)
+
+def sample_custom_pmf(pmf):
+    total = float(sum(pmf))
+
+    if total<=0.0:
+        pmf=[1.0/len(pmf)]*len(pmf)
+        total=1.0
+    
+
+    scale = 1.0 / total
+    pmf = [x * scale for x in pmf]
+    draw = random.random()
+    sum_prob = 0.0
+    for index, prob in enumerate(pmf):
+        sum_prob += prob
+        if sum_prob > draw:
+            return index, prob
+    
+    return len(pmf)-1,pmf[-1]
+
+class VWAgent:
+    def __init__(self,cover=5,epsilon=0.05, quiet=True, extra_args="-q UA"):
+        args=f"--cb_explore_adf --cover {cover} --epsilon {epsilon} {extra_args}"
+        if quiet:
+            args+= " --quiet"
+
+        self.vw=pyvw.Workspace(args)
+    
+    def _parse_examples(self,example_str:str):
+        ex=self.vw.parse(example_str,vowpalwabbit.LabelType.CONTEXTUAL_BANDIT)
+
+        try:
+            exs=list(ex)
+        except TypeError:
+            exs=[ex]
+        return exs
+     
+
+    def get_action(self,shared_ns:str,actions:List[str]):
+        exs=self._parse_examples(to_vw_example_format(shared_ns,actions))
+        try:
+            pmf=self.vw.predict(exs)
+        finally:
+            for e in exs:
+                try:
+                    self.vw.finish_example(e)
+                except Exception:
+                    pass
+        
+        idx,prob=sample_custom_pmf(pmf)
+        return int(idx),float(prob)
+    
+  
+ 
+
+    
+    def learn(self,shared_ns:str,actions:list[str],chosen_index:int,cost:float,prob:float):
+        exs=self._parse_examples(to_vw_example_format(shared_ns,actions,(chosen_index,cost,prob)))
+
+        
+       
+
+        try:
+            self.vw.learn(exs)
+        finally:
+            for e in exs:
+                try:
+                    self.vw.finish_example(e)
+                except Exception:
+                    pass
+
+            
+    
+
+    def finish(self):
+        try:
+            self.vw.finish()
+        except Exception:
+            pass
+
+
+
+
+
+
+import numpy as np
+from .env import ContextualEnv
+from .context import sample_context,context_to_vw_shared
+from .vw_agent import VWAgent
+
+
+class Simulation:
+    def __init__(self,num_campaigns=5,dim=59,horizon=59,seed=123):
+        self.num_campaigns=num_campaigns
+        self.dim=dim
+        self.horizon=horizon
+        self.rng=np.random.default_rng(seed)
+        self.env=ContextualEnv(num_campaigns=num_campaigns,dim=dim,horizon=horizon,seed=seed)
+    
+    def run(self,rounds=5000,vw_cover=5,vw_epsilon=0.2):
+        agent=VWAgent(cover=vw_cover,epsilon=vw_epsilon,extra_args="-q UA")
+
+        avg_reward_agent=np.zeros(rounds)
+        avg_reward_rand =np.zeros(rounds)
+
+        sum_reward_agent=0.0
+        sum_reward_rand=0.0
+
+        for t in range(rounds):
+            ctx=sample_context(self.rng,user_id=int(self.rng.integers(1_000_000)))
+            shared=context_to_vw_shared(ctx)
+            actions=[f"|Action cid={a}" for a in range(self.num_campaigns)]
+
+            agent.get_action(shared,actions)
+
+            chosen_idx,prob =agent.get_action(shared,actions)
+
+            r_agent=self.env.reward(ctx,chosen_idx,normalize=True)
+
+            agent.learn(shared,actions,chosen_idx,cost=1.0-r_agent,prob=max(prob,1e-6))
+
+            rand_idx=int(self.rng.integers(self.num_campaigns))
+            r_rand=self.env.reward(ctx,rand_idx,normalize=True)
+
+
+            sum_reward_agent += r_agent
+            sum_reward_rand += r_rand
+            avg_reward_agent[t]=sum_reward_agent/float(t+1)
+            avg_reward_rand[t]=sum_reward_rand/float(t+1)
+
+            if (t+1)%1000 ==0:
+                print(f"t={t+1} avg_reward_vw={avg_reward_agent[t]:.4f} avg_reward_rand={avg_reward_rand[t]:.4f}")
+        
+        agent.finish()
+
+        return {
+            "avg_reward_vw":avg_reward_agent,
+            "avg_reward_rand":avg_reward_rand,
+        }
