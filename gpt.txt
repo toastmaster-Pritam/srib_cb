@@ -152,3 +152,18 @@ class Simulation:
             "avg_reward_vw":avg_reward_agent,
             "avg_reward_rand":avg_reward_rand,
         }
+
+
+
+Traceback (most recent call last):
+  File "/home/pritam/impatient-vw/main.py", line 22, in <module>
+    main()
+  File "/home/pritam/impatient-vw/main.py", line 6, in main
+    res=sim.run(rounds=8000,vw_cover=5,vw_epsilon=0.2)
+  File "/home/pritam/impatient-vw/src/simulator.py", line 29, in run
+    agent.get_action(shared,actions)
+  File "/home/pritam/impatient-vw/src/vw_agent.py", line 57, in get_action
+    pmf=self.vw.predict(exs)
+  File "/home/pritam/impatient-vw/venv310/lib/python3.10/site-packages/vowpalwabbit/pyvw.py", line 724, in predict
+    pylibvw.vw.predict_multi(self, ec)
+RuntimeError: cb_adf: badly formatted example, only one cost can be known but found 7. Example number=0, tag=sub=0
