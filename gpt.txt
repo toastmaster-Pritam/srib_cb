@@ -1,11 +1,12 @@
-  \resumeSubheading
+\resumeSubheading
   {Samsung Research Institute}{Jul 2025 -- Present}
   {Research Intern — Services PF Team}{Bangalore, India}
 \resumeItemListStart
-  \resumeItem{Working on implementation of \textbf{Reinforcement Learning} techniques to optimize \textbf{A/B testing} strategies.}
-  \resumeItem{Designing and evaluating \textbf{adaptive exploration-exploitation policies} to improve experiment efficiency.}
-  \resumeItem{Developing simulation environments to benchmark learning algorithms under various statistical settings.}
-  \resumeItem{Collaborating with researchers to scale RL-based decision-making to large-scale product experimentation.}
-  \resumeItem{Integrating findings into internal A/B testing platforms to enable \textbf{data-driven optimization} of feature rollouts.}
-  \resumeItem{\textbf{Tech Stack}: Python, TensorFlow, PyTorch, NumPy, Pandas, Internal Experimentation Tools}
+  \resumeItem{Developing a \textbf{Campaign Recommender System} using \textbf{Contextual Bandit Algorithms} to personalize campaign selection.}
+  \resumeItem{Modeling \textbf{long-term user engagement} as the reward mechanism for optimizing recommendation effectiveness.}
+  \resumeItem{Implementing a \textbf{Bayesian filtering framework} to estimate posterior means and variances from empirical priors.}
+  \resumeItem{Applying \textbf{Thompson Sampling}–based policies to balance exploration and exploitation in campaign recommendations.}
+  \resumeItem{Designing simulation environments to benchmark learning performance under different statistical and user-behavioral settings.}
+  \resumeItem{Collaborating with research teams to scale contextual bandit approaches for large-scale \textbf{A/B testing and experimentation} platforms.}
+  \resumeItem{\textbf{Tech Stack}: Python, Sklearn, NumPy, Pandas, Internal Experimentation Tools}
 \resumeItemListEnd
