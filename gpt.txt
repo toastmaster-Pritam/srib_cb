@@ -495,4 +495,250 @@ class BinaryDistribution(Distribution):
         scale = np.diag(np.sqrt(1 / np.diag(mat)))
         return scale @ mat @ scale
 
-5.
+5. env.py
+
+# impatient_contextual/env.py
+import collections
+
+class Environment:
+    def __init__(self, dists):
+        """
+        dists: dict mapping item ID -> Distribution object (EmpiricalDistribution etc.)
+        """
+        self.dists = dists
+        self.history = collections.defaultdict(list)
+
+    def step(self, action, t, n_samples=1, context=None, generator_fn=None):
+        """Return an n_samples x w trace matrix for the chosen action.
+        If generator_fn provided, call it as generator_fn(action, context, n_samples).
+        Else call self.dists[action].sample(n=n_samples).
+        """
+        self.history[t].append(action)
+        if generator_fn is not None:
+            return generator_fn(action, context, n_samples)
+        return self.dists[action].sample(n=n_samples)
+
+    def reset(self):
+        for dist in self.dists.values():
+            try:
+                dist.reset()
+            except Exception:
+                pass
+        self.history = collections.defaultdict(list)
+
+6. env.py
+# impatient_contextual/helper.py
+import numpy as np
+
+class StickinessHelper:
+    def __init__(self, prior_mvec, prior_cmat, noise_cmat=None):
+        self.prior_mvec = prior_mvec
+        self.prior_cmat = prior_cmat
+        self.noise_cmat = noise_cmat
+
+    @classmethod
+    def from_data(cls, data):
+        cmats = np.array([np.cov(mat.T) for mat in data.values()])
+        noise_cmat = np.mean(cmats, axis=0)
+        mvecs = np.array([np.mean(mat, axis=0) for mat in data.values()])
+        prior_mvec = np.mean(mvecs, axis=0)
+        prior_cmat = np.cov(mvecs.T)
+        return cls(prior_mvec, prior_cmat,noise_cmat)
+
+7. main.py
+
+# run_contextual_eval.py  (updated - saves one trained agent per belief)
+import collections
+import itertools
+import matplotlib.pyplot as plt
+import numpy as np
+import pickle
+import os
+from scipy.stats import entropy
+
+from impatient_bandits import (
+    ContextualBayesianBandit,
+    ProgressiveBelief,
+    DelayedBelief,
+    OracleBelief,
+    DayTwoBelief,
+    DummyBelief,
+    EmpiricalDistribution,
+    Environment,
+    StickinessHelper,
+)
+
+# --- Parameters ---
+horizon = 180
+n_shows = 200        # how many arms to use from evaluation file
+n_actions_choices = (10,)
+n_trials = 10
+context_dim = 4      # number of user features (without intercept)
+w = 59               # trace length from Spotify synthetic data
+sigma2 = 0.25
+pb_weight = 0.6
+
+rng = np.random.default_rng(1)
+
+# --- Load training data to estimate priors (same as Spotify) ---
+with open("data/synthetic-data-train.pkl", "rb") as f:
+    raw_train = pickle.load(f)
+data_train = {k: v.astype(float) for k, v in raw_train.items()}
+helper = StickinessHelper.from_data(data_train)
+
+# --- Load eval data (EmpiricalDistributions per show) ---
+with open("data/synthetic-data-eval.pkl", "rb") as f:
+    raw_eval = pickle.load(f)
+data_eval = {k: v.astype(float) for k, v in itertools.islice(raw_eval.items(), n_shows)}
+
+dists = {uri: EmpiricalDistribution(traces, seed=rng) for uri, traces in data_eval.items()}
+env = Environment(dists)
+
+# --- Build a per-arm "true context effect" mapping ---
+# We will attach a small random vector per arm to represent how context shifts activity probabilities.
+# This is used to compute oracle expected reward for a given context (without sampling noise).
+true_theta = {uri: rng.normal(scale=0.8, size=(context_dim + 1,)) for uri in data_eval}  # +1 for intercept
+
+def make_context():
+    age = np.random.uniform(0, 1)
+    device_mobile = np.random.binomial(1, 0.6)
+    recent_eng = np.tanh(np.random.exponential(1.0) / 2.0)
+    premium = np.random.binomial(1, 0.2)
+    return np.array([1.0, age, device_mobile, recent_eng, premium])
+
+# We need a generator_fn that will produce traces conditional on context and the empirical dists.
+# We'll use the empirical distribution mean profile as a base probability; then modulate by context.
+empirical_means = {uri: np.mean(mat, axis=0) for uri, mat in data_eval.items()}
+day_decay = np.linspace(1.0, 0.6, w)
+
+def generate_trace_for_arm(arm, context, n_samples=1):
+    # base probabilities from empirical mean
+    base = empirical_means[arm]
+    # context influence via sigmoid(true_theta[arm] @ context) -> scale factor in [0,1]
+    mu = float(true_theta[arm] @ context)
+    scale = 0.5 * (1.0 / (1.0 + np.exp(-mu))) + 0.5  # keep scale in [0.5, 1.0]
+    probs = np.clip(base * scale * day_decay, 1e-6, 1 - 1e-6)
+    # sample binary traces
+    samples = rng.binomial(1, probs, size=(n_samples, w)).astype(float)
+    return samples
+
+def expected_reward_for_arm(arm, context):
+    # expected stickiness (1 + sum of probabilities) without sampling noise
+    mu = float(true_theta[arm] @ context)
+    scale = 0.5 * (1.0 / (1.0 + np.exp(-mu))) + 0.5
+    probs = np.clip(empirical_means[arm] * scale * day_decay, 1e-6, 1 - 1e-6)
+    return 1.0 + probs.sum()
+
+# === The trial function (Spotify style, adapted for contextual bandit) ===
+def bandit_trial_contextual(env, beliefs, horizon, n_actions, agent_class, generator_fn):
+    """
+    env: Environment
+    beliefs: dict uri -> ProgressiveBelief (initialized)
+    agent_class: ContextualBayesianBandit or similar (we will instantiate prior outside)
+    generator_fn: function(action, context, n_samples)
+    RETURNS: (regrets_array, entropies_array, trained_agent)
+    """
+    # Build agent using beliefs
+    agent = ContextualBayesianBandit(beliefs, dim=context_dim + 1, alpha=1.0, sigma2=sigma2, pb_weight=pb_weight, seed=1)
+    regrets = []
+    entropies = []
+    for t in range(horizon):
+        context = make_context()
+        # Ask agent for n_actions given context
+        actions = agent.act(context, n_actions=n_actions)
+        for action in actions:
+            trace = env.step(action, t, n_samples=1, context=context, generator_fn=generator_fn)
+            agent.update(action, trace, context)
+        agent.step()
+        # compute true/expected rewards for chosen actions and compute regret vs oracle for this context
+        true_rewards = np.array([expected_reward_for_arm(a, context) for a in actions])
+        r_opt = max(expected_reward_for_arm(a, context) for a in env.dists)
+        regrets.append(np.mean(r_opt - true_rewards))
+        # entropy over actions
+        _, counts = np.unique(actions, return_counts=True)
+        probs = counts / counts.sum()
+        entropies.append(entropy(probs))
+    return np.array(regrets), np.array(entropies), agent
+
+# --- Evaluation loop similar to Spotify notebook ---
+belief_classes = (("Progressive", ProgressiveBelief), ("Delayed", DelayedBelief), ("Day-two proxy", DayTwoBelief), ("Oracle", OracleBelief))
+
+reg = collections.defaultdict(dict)
+ent = collections.defaultdict(dict)
+
+# ensure data dir exists for saving the trained agents
+os.makedirs("data", exist_ok=True)
+
+for n in n_actions_choices:
+    print(f"# actions: {n}")
+    for name, cls in belief_classes:
+        reg[n][name] = np.zeros((n_trials, horizon))
+        ent[n][name] = np.zeros((n_trials, horizon))
+
+        last_trained_agent = None  # will hold the agent from the last trial for this belief
+        for k in range(n_trials):
+            print(".", end="", flush=True)
+            env.reset()
+            # initialize beliefs per show using helper priors
+            beliefs = {}
+            for uri in data_eval:
+                beliefs[uri] = cls(prior_mvec=helper.prior_mvec, prior_cmat=helper.prior_cmat, noise_cmat=helper.noise_cmat, cov_estimator="fixed", seed=rng)
+            # Run trial using contextual bandit (we only evaluate Progressive + other belief types here)
+            reg_, ent_, trained_agent = bandit_trial_contextual(env, beliefs, horizon, n, ContextualBayesianBandit, generate_trace_for_arm)
+            reg[n][name][k] = reg_
+            ent[n][name][k] = ent_
+
+            # keep reference to the latest trained agent; we'll save only one per belief below
+            last_trained_agent = trained_agent
+
+        # After all trials for this belief are done, save exactly one trained agent for the belief (the last one)
+        fname = f"data/trained_agent_{name}_n{n}.pkl"
+        try:
+            with open(fname, "wb") as fh:
+                pickle.dump(last_trained_agent, fh, protocol=pickle.HIGHEST_PROTOCOL)
+            print(f" saved -> {fname}")
+        except Exception as e:
+            print(f"\nWARNING: failed to save trained agent to {fname}: {e}")
+
+        print()
+
+fig, axs = plt.subplots(ncols=3, nrows=2, sharex=True, figsize=(14, 7))
+xs = np.arange(1, horizon + 1)
+
+color = {
+    "Progressive": plt.cm.tab10(3),
+    "Delayed": plt.cm.tab10(0),
+    "Day-two proxy": plt.cm.tab10(2),
+    "Oracle": plt.cm.tab10(1),
+}
+for col, n in enumerate(n_actions_choices):
+    axs[0, col].set_title(f"{n} actions / day ($N = {n_shows}$)")
+    for name, regrets in reg[n].items():
+        # Average cumulative regret per round (same formula as Spotify)
+        areg = np.cumsum(regrets, axis=1) / xs
+        mean = np.mean(areg, axis=0)
+        std = np.std(areg, axis=0)
+        axs[0, col].plot(xs, mean, ls="-", color=color[name], label=name)
+        axs[0, col].fill_between(xs, mean - std, mean + std, facecolor=color[name], alpha=0.1)
+        axs[0, col].set_ylim(ymin=0, ymax=3.0)
+        axs[0, col].grid(alpha=0.5)
+
+    for name, entropies in ent[n].items():
+        mean = np.mean(entropies, axis=0)
+        std = np.std(entropies, axis=0)
+        axs[1, col].plot(xs, mean, ls="-", color=color[name], label=name)
+        axs[1, col].fill_between(xs, mean - std, mean + std, facecolor=color[name], alpha=0.1)
+        axs[1, col].set_ylim(ymin=0, ymax=5)
+        axs[1, col].set_xlabel("Days")
+        axs[1, col].grid(alpha=0.5)
+
+axs[1, 0].legend(frameon=True, ncol=2, handlelength=1.5)
+axs[0, 2].set_xlim(xmin=1, xmax=horizon)
+axs[0, 2].set_xticks(np.arange(30, horizon + 1, step=30))
+axs[0, 0].set_ylabel("Average regret")
+axs[1, 0].set_ylabel("Entropy")
+plt.tight_layout()
+plt.savefig("data/synthetic-data-eval.png")
+plt.show()
+
+
