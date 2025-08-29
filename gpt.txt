@@ -1,12 +1,498 @@
-\resumeSubheading
-  {Samsung Research Institute}{Jul 2025 -- Present}
-  {Research Intern — Services PF Team}{Bangalore, India}
-\resumeItemListStart
-  \resumeItem{Developing a \textbf{Campaign Recommender System} using \textbf{Contextual Bandit Algorithms} to personalize campaign selection.}
-  \resumeItem{Modeling \textbf{long-term user engagement} as the reward mechanism for optimizing recommendation effectiveness.}
-  \resumeItem{Implementing a \textbf{Bayesian filtering framework} to estimate posterior means and variances from empirical priors.}
-  \resumeItem{Applying \textbf{Thompson Sampling}–based policies to balance exploration and exploitation in campaign recommendations.}
-  \resumeItem{Designing simulation environments to benchmark learning performance under different statistical and user-behavioral settings.}
-  \resumeItem{Collaborating with research teams to scale contextual bandit approaches for large-scale \textbf{A/B testing and experimentation} platforms.}
-  \resumeItem{\textbf{Tech Stack}: Python, Sklearn, NumPy, Pandas, Internal Experimentation Tools}
-\resumeItemListEnd
+belief.py
+
+import abc
+import numpy as np
+import scipy.linalg as spl
+
+
+class GaussianBelief(metaclass=abc.ABCMeta):
+
+    """Abstract base class for Gaussian stickiness beliefs."""
+
+    def __init__(self, mean, var, seed=None):
+        self.mean = mean
+        self.var = var
+        # Random number generator
+        self.rng = np.random.default_rng(seed=seed)
+        # Timestep at which posterior last computed.
+        self.t_post = 0
+        # Whether there is new data which needs to be conditioned upon.
+        self.has_new_obs = False
+
+    @abc.abstractmethod
+    def compute_posterior(self, t):
+        """Compute posterior using data up to timestep `t`."""
+
+    def sample_from_posterior(self, t):
+        # Only re-compute the posterior if a) we have new observations available
+        # or b) we have not already computed the posterior for this timestep.
+        if self.has_new_obs or t != self.t_post:
+            self.compute_posterior(t)
+        return self.mean + np.sqrt(self.var) * self.rng.standard_normal()
+
+
+class ProgressiveBelief(GaussianBelief):
+
+    """Stickiness belief making use of partial observations."""
+
+    def __init__(
+        self,
+        prior_mvec,
+        prior_cmat,
+        noise_cmat,
+        cov_estimator="fixed",
+        seed=None,
+    ):
+        self.prior_mvec = prior_mvec  # w-dim prior mean vector.
+        self.prior_cmat = prior_cmat  # w x w prior covariance matrix.
+        self.noise_cmat = noise_cmat  # w x w noise covariance matrix.
+        self.w = len(prior_mvec)  # Stickiness window size / feedback delay.
+        self.cov_estimator = cov_estimator  # Options: fixed, regularized.
+        # Data.
+        self.traces = np.zeros((0, self.w))  # Activity traces.
+        self.ts = np.zeros(0, dtype=int)  # Starting timesteps.
+        super().__init__(
+            mean=np.sum(self.prior_mvec),
+            var=np.sum(self.prior_cmat),
+            seed=seed,
+        )
+
+    def update(self, traces, t):
+        """Add observation.
+
+        Parameters
+        ----------
+        traces : ndarray, shape (m, w) or (w,)
+            User activity traces.
+        t : int
+            Timestep of first observation.
+        """
+        m = np.atleast_2d(traces).shape[0]
+        self.traces = np.vstack((self.traces, traces))
+        self.ts = np.hstack((self.ts, np.repeat(t, m)))
+        self.has_new_obs = True
+
+    def compute_posterior(self, t):
+        """Compute mean & variance of belief at step `t`."""
+        # Step 1: filter observations.
+        m = len(self.ts)
+        # Binary mask indicating entries observed at time `t`.
+        mask = np.tile(np.arange(self.w), (m, 1)) < (t - self.ts)[:, None]
+        mat = np.zeros_like(self.traces)
+        mat[mask] = self.traces[mask]
+        n_users = np.sum(mask, axis=0)
+
+        # Step 2: Compute empirical mean and noise covariance.
+        # `k` is the first timestep with no observations.
+        k = np.min(np.argwhere(n_users == 0), initial=self.w)
+        empirical_mvec = mat[:, :k].sum(axis=0) / n_users[:k]
+        denom_min = np.minimum(n_users[:k, None], n_users[None, :k])
+        denom_max = np.maximum(n_users[:k, None], n_users[None, :k])
+        if self.cov_estimator == "fixed":
+            noise_cmat = self.noise_cmat[:k, :k] / denom_max
+        elif self.cov_estimator == "regularized":
+            tmp = mat[:, :k] - empirical_mvec
+            noise_cmat = (tmp.T @ tmp + self.noise_cmat[:k, :k]) / (
+                (denom_min + 1) * denom_max
+            )
+        else:
+            raise ValueError(f"method {self.cov_estimator} unknown")
+
+        # Step 3: Combine with prior to compute posterior.
+        # Kernel plus noise.
+        kpn = self.prior_cmat[:k, :k] + noise_cmat
+        # Inverse kernel plus noise.
+        ikpn = spl.solve(kpn, np.eye(len(kpn)), assume_a="pos")
+        post_mvec = self.prior_mvec + self.prior_cmat[:, :k] @ ikpn @ (
+            empirical_mvec - self.prior_mvec[:k]
+        )
+        post_cmat = (
+            self.prior_cmat - self.prior_cmat[:, :k] @ ikpn @ self.prior_cmat[:k, :]
+        )
+
+        # Update univariate stickiness belief.
+        self.mean = np.sum(post_mvec)
+        self.var = np.sum(post_cmat)
+        self.t_post = t
+        self.has_new_obs = False
+
+
+class UnivariateBelief(GaussianBelief):
+
+    """Base class for univariate stickiness beliefs."""
+
+    def __init__(
+        self,
+        prior_mvec,
+        prior_cmat,
+        noise_cmat,
+        cov_estimator="fixed",
+        seed=None,
+    ):
+        self.prior_mean = np.sum(prior_mvec)
+        self.prior_var = np.sum(prior_cmat)
+        self.noise_var = np.sum(noise_cmat)
+        self.cov_estimator = cov_estimator  # Options: fixed, regularized.
+        self.w = len(prior_mvec)  # Stickiness window size / feedback delay.
+        # Data.
+        self.ys = np.zeros(0)  # Scalar observations.
+        self.ts = np.zeros(0, dtype=int)  # Timestep of observation.
+        super().__init__(
+            mean=self.prior_mean,
+            var=self.prior_var,
+            seed=seed,
+        )
+
+    @abc.abstractmethod
+    def update(self, traces, t):
+        """Add observation.
+
+        Parameters
+        ----------
+        traces : ndarray, shape (m, w) or (w,)
+            User activity traces.
+        t : int
+            Timestep of first observation.
+        """
+
+    def compute_posterior(self, t):
+        """Compute mean & variance of belief at step `t`."""
+        ys = self.ys[self.ts < t]
+        m = len(ys)
+        # If no observations, set posterior to the prior
+        if m == 0:
+            self.var = self.prior_var
+            self.mean = self.prior_mean
+        # Otherwise, compute posterior by conditioning on observations
+        else:
+            if self.cov_estimator == "fixed":
+                noise_var = self.noise_var / m
+            elif self.cov_estimator == "regularized":
+                noise_var = (np.var(ys) + self.noise_var / m) / (m + 1)
+            else:
+                raise ValueError(f"method {self.cov_estimator} unknown")
+            self.var = 1 / (1 / self.prior_var + 1 / noise_var)
+            self.mean = self.var * (
+                self.prior_mean / self.prior_var + np.mean(ys) / noise_var
+            )
+        self.t_post = t
+        self.has_new_obs = False
+
+
+class OracleBelief(UnivariateBelief):
+
+    """Stickiness belief assuming immediate access to the long-term reward."""
+
+    def update(self, traces, t):
+        traces = np.atleast_2d(traces)
+        self.ys = np.hstack((self.ys, np.sum(traces, axis=1)))
+        self.ts = np.hstack((self.ts, np.repeat(t, traces.shape[0])))
+        self.has_new_obs = True
+
+
+class DelayedBelief(UnivariateBelief):
+
+    """Stickiness belief assuming immediate access to the long-term reward."""
+
+    def update(self, traces, t):
+        traces = np.atleast_2d(traces)
+        self.ys = np.hstack((self.ys, np.sum(traces, axis=1)))
+        # Add delay to timestamp.
+        self.ts = np.hstack((self.ts, np.repeat(t + self.w, traces.shape[0])))
+        self.has_new_obs = True
+
+
+class DayTwoBelief(UnivariateBelief):
+
+    """Using day-two activity as a proxy for stickiness."""
+
+    def __init__(
+        self,
+        prior_mvec,
+        prior_cmat,
+        noise_cmat,
+        cov_estimator="fixed",
+        seed=None,
+    ):
+        self.prior_mean = prior_mvec[0]
+        self.prior_var = prior_cmat[0, 0]
+        self.noise_var = noise_cmat[0, 0]
+        self.cov_estimator = cov_estimator  # Options: fixed, regularized.
+        # Data.
+        self.ys = np.zeros(0)  # Scalar observations.
+        self.ts = np.zeros(0, dtype=int)  # Timestep of observation.
+        GaussianBelief.__init__(
+            self,
+            mean=self.prior_mean,
+            var=self.prior_var,
+            seed=seed,
+        )
+
+    def update(self, traces, t):
+        traces = np.atleast_2d(traces)
+        # Pick out activity on the first day.
+        self.ys = np.hstack((self.ys, traces[:, 0]))
+        self.ts = np.hstack((self.ts, np.repeat(t, traces.shape[0])))
+        self.has_new_obs = True
+
+
+class DummyBelief:
+
+    """Dummy belief that makes the agent act randomly."""
+
+    def __init__(self, seed=None, **kwargs):
+        self.rng = np.random.default_rng(seed=seed)
+
+    def update(self, traces, t):
+        pass
+
+    def sample_from_posterior(self, t):
+        return self.rng.standard_normal()
+
+2. contextual bandit.py
+# impatient_contextual/contextual_bandit.py
+import numpy as np
+from .contextual_model import BayesianLinearModel
+
+class ContextualBayesianBandit:
+    """
+    Contextual bandit that combines per-arm:
+      - ProgressiveBelief (trace-based posterior over stickiness scalar)
+      - BayesianLinearModel (context -> scalar reward)
+    Selection (Thompson-style): for each arm sample theta and a progressive belief draw,
+    compute combined score = theta^T x + pb_weight * pb_sample, pick argmax.
+    """
+
+    def __init__(self, beliefs, dim, alpha=1.0, sigma2=0.25, pb_weight=1.0, seed=None):
+        """
+        beliefs: dict mapping arm -> ProgressiveBelief (or other belief class)
+        dim: context dimension (including intercept)
+        """
+        self.beliefs = beliefs
+        self.arms = list(beliefs.keys())
+        self.models = {a: BayesianLinearModel(dim, alpha=alpha, sigma2=sigma2) for a in self.arms}
+        self.pb_weight = pb_weight
+        self.t = 0
+        self.rng = np.random.default_rng(seed)
+
+    def act(self, context, n_actions=1, admissible=None):
+        if admissible is None:
+            admissible = self.arms
+        actions = []
+        for _ in range(n_actions):
+            # sample per-arm value
+            values = []
+            for a in admissible:
+                # sample theta
+                theta = self.models[a].sample_theta()
+                pred = float(theta @ context)
+                # sample progressive belief
+                pb = 0.0
+                try:
+                    pb = self.beliefs[a].sample_from_posterior(self.t)
+                except Exception:
+                    pb = 0.0
+                values.append(pred + self.pb_weight * pb)
+            idx = int(np.argmax(values))
+            actions.append(admissible[idx])
+        return actions
+
+    def update(self, item, traces, context):
+        """traces: array-like (w,) or (n, w)
+           context: vector (dim,)
+        """
+        # 1) Update progressive belief with traces
+        try:
+            self.beliefs[item].update(traces, self.t)
+        except Exception:
+            pass
+
+        # 2) Convert traces -> scalar reward(s) and update context model
+        traces = np.atleast_2d(traces)
+        rewards = 1.0 + traces.sum(axis=1)  # scalar long-term reward proxy
+        for r in rewards:
+            self.models[item].update(context, float(r))
+
+    def step(self):
+        self.t += 1
+
+3. contextual_model.py
+# impatient_contextual/contextual_model.py
+import numpy as np
+from numpy.linalg import inv
+
+class BayesianLinearModel:
+    """
+    Bayesian linear regression with Gaussian prior N(0, alpha*I) and known noise variance.
+    Natural parameters: Lambda (precision) and b.
+    """
+
+    def __init__(self, dim, alpha=1.0, sigma2=0.25):
+        self.dim = dim
+        self.alpha = alpha
+        self.sigma2 = sigma2
+        self.Lambda = np.eye(dim) / alpha
+        self.b = np.zeros(dim)
+
+    def sample_theta(self):
+        cov = inv(self.Lambda)
+        mean = cov @ self.b
+        return np.random.multivariate_normal(mean, cov)
+
+    def update(self, x, y):
+        x = x.reshape(-1)
+        self.Lambda += np.outer(x, x) / self.sigma2
+        self.b += (x * y) / self.sigma2
+
+    def posterior_mean(self):
+        return inv(self.Lambda) @ self.b
+
+4. data.py
+import abc
+import itertools
+import numpy as np
+import scipy.stats as sps
+import warnings
+
+
+class Distribution(metaclass=abc.ABCMeta):
+    @abc.abstractmethod
+    def sample(self, n=1):
+        """Generate samples from the distribution."""
+
+    def reset(self):
+        pass
+
+
+class EmpiricalDistribution(Distribution):
+
+    """Empirical distribution of a dataset."""
+
+    def __init__(self, traces, seed=42):
+        self.rng = np.random.default_rng(seed=seed)
+        self.traces = traces
+        self.mvec = np.mean(traces, axis=0)
+        self.reset()
+
+    @property
+    def mean_sum(self):
+        """Compute ground truth stickiness."""
+        # Add 1.0 as we assume activity on the first day.
+        return 1.0 + np.sum(self.mvec)
+
+    def sample(self, n=1):
+        """Sample user traces from the dataset without replacement."""
+        traces = np.array(list(itertools.islice(self.itr, n)))
+        self.consumed += n
+        if self.consumed > len(self.traces):
+            warnings.warn("sampled more user traces than available")
+        return traces
+
+    def reset(self):
+        """Reset the sampler."""
+        self.rng.shuffle(self.traces)
+        self.itr = itertools.cycle(self.traces)
+        self.consumed = 0
+
+
+class IIDBernoulliDistribution(Distribution):
+
+    """IID Bernoullis with prescribed probability."""
+
+    def __init__(self, p, w=59, seed=42):
+        self.p = p
+        self.w = w
+        self.rng = np.random.default_rng(seed=seed)
+
+    @property
+    def mean_sum(self):
+        """Compute ground truth stickiness."""
+        # Add 1.0 as we assume activity on the first day.
+        return 1.0 + (self.w * self.p)
+
+    def sample(self, n=1):
+        return self.rng.binomial(1, self.p, size=(n, self.w)).astype(float)
+
+
+class GaussianDistribution(Distribution):
+
+    """Multivariate Gaussian distribution over real-valued vectors."""
+
+    def __init__(self, mvec, cmat, seed=42):
+        self.chol = np.linalg.cholesky(cmat)
+        self.mvec = mvec
+        self.w = len(mvec)
+        self.rng = np.random.default_rng(seed=seed)
+
+    @property
+    def mean_sum(self):
+        """Compute ground truth stickiness."""
+        # Add 1.0 as we assume activity on the first day.
+        return 1.0 + np.sum(self.mvec)
+
+    def sample(self, n=1):
+        return self.mvec + self.rng.normal(size=(n, self.w)) @ self.chol.T
+
+    @classmethod
+    def niw_generator(cls, mu, psi, nu, lm, seed=42):
+        rng = np.random.default_rng(seed=seed)
+        while True:
+            cmat = sps.invwishart.rvs(df=nu, scale=psi, random_state=rng)
+            mvec = rng.multivariate_normal(mu, cmat / lm)
+            yield cls(mvec, cmat, seed=rng)
+
+
+class BinaryDistribution(Distribution):
+
+    """
+    Distribution over binary vectors with prescribed mean and correlation
+    matrix.
+    """
+
+    def __init__(self, mat, seed=42):
+        self.rng = np.random.default_rng(seed=seed)
+        # `mat` is the Gaussian covariance matrix H defined here:
+        # <https://mathoverflow.net/a/219427>
+        self.chol = np.linalg.cholesky(mat)
+        self.mvec = np.arcsin(mat[-1, :-1]) / np.pi + 0.5
+
+    @property
+    def mean_sum(self):
+        """Compute ground truth stickiness."""
+        # Add 1.0 as we assume activity on the first day.
+        return 1.0 + np.sum(self.mvec)
+
+    def sample(self, n=1):
+        samples = np.sign(self.rng.normal(size=(n, len(self.chol))) @ self.chol.T)
+        samples = samples[:, :-1] * samples[:, -1:]
+        return (samples > 0).astype(float)
+
+    @classmethod
+    def from_traces(cls, traces, seed=42):
+        traces = 2 * traces - 1  # Transform from {0, 1} to {-1, +1}.
+        mvec = np.mean(traces, axis=0)
+        smat = traces.T @ traces / len(traces)
+        return cls.from_moments(mvec, smat, seed=seed)
+
+    @classmethod
+    def from_moments(cls, mvec, smat, seed=42):
+        w = len(mvec)
+        mat = np.zeros((w + 1, w + 1))
+        mat[:w, :w] = smat
+        mat[:w, w] = mat[w, :w] = mvec
+        mat[w, w] = 1.0
+        transf = BinaryDistribution.project(np.sin(np.pi * mat / 2))
+        return cls(transf, seed=seed)
+
+    @staticmethod
+    def project(mat):
+        """Project Gaussian covariance matrix onto feasible set."""
+        # Find closest PD matrix w.r.t. Frobenius norm.
+        eigvals, eigvecs = np.linalg.eigh(mat)
+        eigvals[eigvals < 1e-6] = 1e-6
+        mat = eigvecs @ np.diag(eigvals) @ eigvecs.T
+        # Rescale matrix to ensure unit diagonal
+        scale = np.diag(np.sqrt(1 / np.diag(mat)))
+        return scale @ mat @ scale
+
+5.
