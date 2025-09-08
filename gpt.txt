@@ -900,3 +900,22 @@ axs[0].set_ylabel("Day");
 
 
 
+# actions: 10
+.......... saved -> data/trained_agent_Progressive_n10.pkl
+
+=== OFFLINE POLICY EVALUATION (OPE) ===
+Progressive | IPS: 3.200678  (boot mean 3.191116, CI95 2.949499 .. 3.456158)
+Progressive | SNIPS: 5.115810  (boot mean 5.108197, CI95 4.945322 .. 5.267896)
+Progressive | DM: 5.115995  (boot mean 5.116178, CI95 5.099008 .. 5.134932)
+Progressive | DR: 5.173260  (boot mean 5.168859, CI95 5.066048 .. 5.266792)
+Progressive | diagnostics: coverage=0.456, ESS=549.5, avg_weight=0.626
+
+.......... saved -> data/trained_agent_Dummy_n10.pkl
+
+=== OFFLINE POLICY EVALUATION (OPE) ===
+Dummy | IPS: 2.642387  (boot mean 2.643035, CI95 2.223402 .. 3.071829)
+Dummy | SNIPS: 4.868015  (boot mean 4.868958, CI95 4.593749 .. 5.137506)
+Dummy | DM: 4.683970  (boot mean 4.683653, CI95 4.666497 .. 4.700457)
+Dummy | DR: 4.822568  (boot mean 4.824258, CI95 4.685773 .. 4.981276)
+Dummy | diagnostics: coverage=0.149, ESS=152.0, avg_weight=0.543
+
