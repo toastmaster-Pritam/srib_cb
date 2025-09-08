@@ -784,3 +784,20 @@ def evaluate_offline(dataset: List[LoggedStep], arms: List[str],
         "DR":    {"value": float(dr),    "boot_mean": dr_m,  "ci95": (dr_lo, dr_hi)},
         "diagnostics": {"coverage": coverage, "ess": float(ess), "avg_weight": float(np.mean(w))}
     }
+
+
+
+Traceback (most recent call last):
+  File "/home/pritam/contextual-bandit/main.py", line 206, in <module>
+    metrics = evaluate_offline(
+              ^^^^^^^^^^^^^^^^^
+  File "/home/pritam/contextual-bandit/impatient_bandits/ope.py", line 91, in evaluate_offline
+    a_e=np.array([eval_action_fn(x) for x in x_arr])
+                  ^^^^^^^^^^^^^^^^^
+  File "/home/pritam/contextual-bandit/main.py", line 177, in eval_action_fn
+    return last_trained_agent.greedy_action(x)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/pritam/contextual-bandit/impatient_bandits/contextual_bandit.py", line 78, in greedy_action
+    pred=float(theta_mean @ context)
+               ~~~~~~~~~~~^~~~~~~~~
+ValueError: matmul: Input operand 0 does not have enough dimensions (has 0, gufunc core with signature (n?,k),(k,m?)->(n?,m?) requires 1)
