@@ -1,38 +1,41 @@
 
 horizon = 180
-n_shows = 200        # how many arms to use from evaluation file
+n_shows = 200
 n_actions_choices = (10,)
 n_trials = 10
-context_dim = 4      # number of user features (without intercept)
-w = 59               # trace length from Spotify synthetic data
+context_dim = 4        # features excluding intercept
+w = 59                 # trace length
 sigma2 = 0.25
 pb_weight = 0.6
 
-# reproducible experiment RNG
+# reproducible RNG for orchestration
 rng = np.random.default_rng(1)
 
-# --- Load training data to estimate priors (same as Spotify) ---
+# ----------------------------
+# Load priors and evaluation data
+# ----------------------------
 with open("data/synthetic-data-train.pkl", "rb") as f:
     raw_train = pickle.load(f)
 data_train = {k: v.astype(float) for k, v in raw_train.items()}
 helper = StickinessHelper.from_data(data_train)
 
-# --- Load eval data (EmpiricalDistributions per show) ---
 with open("data/synthetic-data-eval.pkl", "rb") as f:
     raw_eval = pickle.load(f)
 data_eval = {k: v.astype(float) for k, v in itertools.islice(raw_eval.items(), n_shows)}
 
-# --- IMPORTANT: pass integer seeds to EmpiricalDistribution (it expects an int seed) ---
+# Build empirical distributions (pass integer seeds)
 dists = {
     uri: EmpiricalDistribution(traces, seed=int(rng.integers(0, 2**31 - 1)))
     for uri, traces in data_eval.items()
 }
 env = Environment(dists)
 
-# --- Build a per-arm "true context effect" mapping ---
-true_theta = {uri: rng.normal(scale=0.8, size=(context_dim + 1,)) for uri in data_eval}  # +1 for intercept
+# true per-arm context effect used by synthetic generator
+true_theta = {uri: rng.normal(scale=0.8, size=(context_dim + 1,)) for uri in data_eval}
 
-# context generator (use same RNG)
+# ----------------------------
+# Context / generator helpers
+# ----------------------------
 def make_context():
     age = float(rng.uniform(0, 1))
     device_mobile = int(rng.binomial(1, 0.6))
@@ -40,19 +43,18 @@ def make_context():
     premium = int(rng.binomial(1, 0.2))
     return np.array([1.0, age, device_mobile, recent_eng, premium])
 
-# base empirical means and day decay (used by generator_fn)
 empirical_means = {uri: np.mean(mat, axis=0) for uri, mat in data_eval.items()}
 day_decay = np.linspace(1.0, 0.6, w)
 
+
 def generate_trace_for_arm(arm, context, n_samples=1):
-    # base probabilities from empirical mean
     base = empirical_means[arm]
-    # context influence via sigmoid(true_theta[arm] @ context) -> scale factor in [0.5,1.0]
     mu = float(true_theta[arm] @ context)
     scale = 0.5 * (1.0 / (1.0 + np.exp(-mu))) + 0.5
     probs = np.clip(base * scale * day_decay, 1e-6, 1 - 1e-6)
     samples = rng.binomial(1, probs, size=(n_samples, w)).astype(float)
     return samples
+
 
 def expected_reward_for_arm(arm, context):
     mu = float(true_theta[arm] @ context)
@@ -60,40 +62,203 @@ def expected_reward_for_arm(arm, context):
     probs = np.clip(empirical_means[arm] * scale * day_decay, 1e-6, 1 - 1e-6)
     return 1.0 + probs.sum()
 
+
 def reward_from_trace(trace):
     arr = np.atleast_2d(trace)
     return float(1.0 + arr.sum())
 
-# === The trial function (Spotify style, adapted for contextual bandit) ===
-def bandit_trial_contextual(env, beliefs, horizon, n_actions, agent_class, generator_fn):
+
+# ----------------------------
+# Utility: robust vector alignment & posterior extraction
+# ----------------------------
+def _safe_align_vec(vec, target_len):
+    """Return 1-D array of length target_len by padding/truncating vec safely."""
+    v = np.asarray(vec).reshape(-1)
+    if v.size == target_len:
+        return v.astype(float)
+    if v.size < target_len:
+        out = np.zeros(target_len, dtype=float)
+        out[: v.size] = v
+        return out
+    # v.size > target_len
+    return v[:target_len].astype(float)
+
+
+def _safe_posterior_mean_of_model(model, target_len):
     """
-    env: Environment
-    beliefs: dict uri -> ProgressiveBelief (initialized)
-    agent_class: ContextualBayesianBandit
-    generator_fn: function(action, context, n_samples)
-    RETURNS: (regrets_array, entropies_array, trained_agent)
+    Return a 1-D numpy array of length target_len representing posterior mean.
+    Fall back to zeros if anything goes wrong.
     """
+    try:
+        pm = model.posterior_mean()
+        arr = np.asarray(pm).reshape(-1)
+    except Exception:
+        return np.zeros(target_len, dtype=float)
+    # If scalar returned (0-d), expand
+    if arr.ndim == 0:
+        arr = arr.reshape(1)
+    return _safe_align_vec(arr, target_len)
+
+
+# ----------------------------
+# Estimate Thompson propensities (vectorized MC)
+# ----------------------------
+def estimate_thompson_probas(agent, context, B=500, rng_local=None):
+    """
+    Estimate p_b(a | context) for a Thompson-sampling agent by Monte Carlo.
+    - agent: ContextualBayesianBandit instance (current state)
+    - context: 1-D array
+    - B: number of MC draws
+    - rng_local: np.random.Generator for sampling (optional)
+    Returns dict arm -> prob
+    """
+    if rng_local is None:
+        rng_local = np.random.default_rng(int(rng.integers(0, 2**31 - 1)))
+    arms = agent.arms
+    K = len(arms)
+    x = np.asarray(context).reshape(-1)
+    dim_x = x.size
+
+    # store sampled values per arm
+    values = np.full((K, B), -np.inf, dtype=float)
+
+    for i, a in enumerate(arms):
+        # model posterior mean & covariance (safe)
+        try:
+            model = agent.models[a]
+            # posterior covariance = inv(Lambda)
+            Lambda = np.asarray(model.Lambda)
+            # safeguard inversion with jitter if needed
+            try:
+                cov = np.linalg.inv(Lambda)
+            except Exception:
+                # add small jitter and retry
+                jitter = 1e-6
+                cov = np.linalg.inv(Lambda + np.eye(Lambda.shape[0]) * jitter)
+            mean = _safe_posterior_mean_of_model(model, Lambda.shape[0])
+        except Exception:
+            mean = np.zeros(dim_x, dtype=float)
+            cov = np.eye(dim_x, dtype=float) * 1e-6
+
+        # align mean/cov to dim_x
+        if cov.shape[0] != dim_x or cov.shape[1] != dim_x:
+            # if larger, truncate; if smaller, pad with small diag noise
+            if cov.shape[0] >= dim_x and cov.shape[1] >= dim_x:
+                cov = cov[:dim_x, :dim_x]
+            else:
+                newcov = np.eye(dim_x, dtype=float) * 1e-6
+                newcov[: cov.shape[0], : cov.shape[1]] = cov
+                cov = newcov
+            mean = _safe_align_vec(mean, dim_x)
+        else:
+            mean = _safe_align_vec(mean, dim_x)
+
+        # progressive belief posterior mean & std
+        try:
+            bel = agent.beliefs[a]
+            try:
+                # ensure posterior is computed up-to-date for agent.t
+                if getattr(bel, "has_new_obs", False) or getattr(bel, "t_post", None) != getattr(agent, "t", None):
+                    bel.compute_posterior(getattr(agent, "t", 0))
+            except Exception:
+                pass
+            pb_mean = float(getattr(bel, "mean", 0.0))
+            pb_var = float(getattr(bel, "var", 0.0))
+            pb_std = float(np.sqrt(max(pb_var, 1e-12)))
+        except Exception:
+            pb_mean = 0.0
+            pb_std = 1e-6
+
+        # sample theta draws (B x dim_x)
+        try:
+            thetas = rng_local.multivariate_normal(mean, cov, size=B)
+            thetas = np.atleast_2d(thetas)
+            if thetas.shape[1] != dim_x:
+                tmp = np.zeros((thetas.shape[0], dim_x), dtype=float)
+                tmp[:, : thetas.shape[1]] = thetas[:, : min(thetas.shape[1], dim_x)]
+                thetas = tmp
+        except Exception:
+            # fallback: repeat mean
+            thetas = np.tile(mean.reshape(1, -1), (B, 1))
+
+        # linear preds and pb samples
+        try:
+            preds = thetas @ x
+        except Exception:
+            preds = np.zeros(B, dtype=float)
+
+        pb_samples = pb_mean + pb_std * rng_local.standard_normal(size=B)
+
+        # combine with pb_weight
+        pw = float(getattr(agent, "pb_weight", pb_weight))
+        values[i, :] = preds + pw * pb_samples
+
+    # for each MC draw, select argmax arm
+    chosen = np.argmax(values, axis=0)
+    counts = np.bincount(chosen, minlength=K)
+    probas = counts.astype(float) / float(B)
+    return {arms[i]: float(probas[i]) for i in range(K)}
+
+
+# ----------------------------
+# Thompson training + logging (uses estimate_thompson_probas)
+# ----------------------------
+def bandit_trial_contextual_with_logging(env, beliefs, horizon, n_actions, agent_class, generator_fn, propensity_mc=500):
+    """
+    Train a Thompson-style contextual bandit and log data produced by that behavior.
+    Returns (regrets, entropies, trained_agent, logged_list_of_LoggedStep).
+    """
+    # agent seed for reproducibility (use rng to generate)
+    agent_seed = int(rng.integers(0, 2**31 - 1))
     agent = ContextualBayesianBandit(
-        beliefs, dim=context_dim + 1, alpha=1.0, sigma2=sigma2, pb_weight=pb_weight, seed=1
+        beliefs, dim=context_dim + 1, alpha=1.0, sigma2=sigma2, pb_weight=pb_weight, seed=agent_seed
     )
+
     regrets = []
     entropies = []
+    logged = []
+
+    # create a local RNG for propensity MC to avoid interfering with global RNG
+    rng_prop = np.random.default_rng(int(rng.integers(0, 2**31 - 1)))
+
     for t in range(horizon):
         context = make_context()
+
+        # sample actions under Thompson (this advances internal model RNG)
         actions = agent.act(context, n_actions=n_actions)
+
+        # estimate propensities under the agent's current posterior (MC)
+        try:
+            probas = estimate_thompson_probas(agent, context, B=propensity_mc, rng_local=rng_prop)
+        except Exception:
+            # fallback uniform
+            probas = {a: 1.0 / len(agent.arms) for a in agent.arms}
+
+        # for each selected action, observe trace, log and update agent
         for action in actions:
+            p_b = max(probas.get(action, 0.0), 1e-12)
             trace = env.step(action, t, n_samples=1, context=context, generator_fn=generator_fn)
+            r = reward_from_trace(trace)
+            logged.append(LoggedStep(x=context.copy(), a=action, r=r, p_b=p_b, t=t))
             agent.update(action, trace, context)
+
         agent.step()
+
+        # compute regret & entropy (online diagnostic)
         true_rewards = np.array([expected_reward_for_arm(a, context) for a in actions])
         r_opt = max(expected_reward_for_arm(a, context) for a in env.dists)
         regrets.append(np.mean(r_opt - true_rewards))
+
         _, counts = np.unique(actions, return_counts=True)
         probs = counts / counts.sum()
         entropies.append(entropy(probs))
-    return np.array(regrets), np.array(entropies), agent
 
-# === Evaluation loop similar to Spotify notebook ===
+    return np.array(regrets), np.array(entropies), agent, logged
+
+
+# ----------------------------
+# Main evaluation loop (train multiple beliefs and run OPE using logged data from training)
+# ----------------------------
 belief_classes = (
     ("Progressive", ProgressiveBelief),
     ("Delayed", DelayedBelief),
@@ -114,9 +279,13 @@ for n in n_actions_choices:
         ent[n][name] = np.zeros((n_trials, horizon))
 
         last_trained_agent = None
+        last_logged_data = None
+
         for k in range(n_trials):
             print(".", end="", flush=True)
             env.reset()
+
+            # initialize beliefs per arm
             beliefs = {}
             for uri in data_eval:
                 beliefs[uri] = cls(
@@ -126,13 +295,18 @@ for n in n_actions_choices:
                     cov_estimator="fixed",
                     seed=int(rng.integers(0, 2**31 - 1)),
                 )
-            reg_, ent_, trained_agent = bandit_trial_contextual(
-                env, beliefs, horizon, n, ContextualBayesianBandit, generate_trace_for_arm
+
+            # Train + log under Thompson behavior (this returns logged dataset generated by same policy)
+            reg_, ent_, trained_agent, logged_data = bandit_trial_contextual_with_logging(
+                env, beliefs, horizon, n, ContextualBayesianBandit, generate_trace_for_arm, propensity_mc=500
             )
+
             reg[n][name][k] = reg_
             ent[n][name][k] = ent_
             last_trained_agent = trained_agent
+            last_logged_data = logged_data
 
+        # save last trained agent for this belief
         fname = f"data/trained_agent_{name}_n{n}.pkl"
         try:
             with open(fname, "wb") as fh:
@@ -141,93 +315,51 @@ for n in n_actions_choices:
         except Exception as e:
             print(f"\nWARNING: failed to save trained agent to {fname}: {e}")
 
-        # --- OFFLINE EVALUATION (OPE) ---
+        # ----------------------------
+        # Offline Policy Evaluation using the logged dataset obtained under Thompson behavior
+        # ----------------------------
+        if last_logged_data is None or len(last_logged_data) == 0:
+            print(f"{name} | no logged data collected; skipping OPE")
+            continue
+
         arms = list(env.dists.keys())
         dim = context_dim + 1
 
-        logging_policy = SoftmaxLoggingPolicy(
-            arms=arms, dim=dim, seed=int(rng.integers(0, 2**31 - 1)), beta=1.0, floor=0.01
-        )
-        env.reset()
-        logged_data = collect_logged_data(
-            env=env,
-            horizon=horizon * 2,
-            make_context=make_context,
-            generator_fn=generate_trace_for_arm,
-            reward_from_trace=reward_from_trace,
-            logging_policy=logging_policy,
-        )
-
+        # Fit Direct Method on logged data
         dm_model = DirectMethodModel(arms=arms, dim=dim, alpha=1.0, sigma2=sigma2)
-        dm_model.fit(logged_data)
+        dm_model.fit(last_logged_data)
 
-        # -------------------------
-        # Robust deterministic evaluator (REPLACES calling agent.greedy_action directly)
-        # -------------------------
-        def _safe_posterior_mean(model):
-            """
-            Wrap model.posterior_mean() and return 1-D numpy array if possible.
-            If it fails or returns scalar, normalize to 1-D array.
-            """
-            try:
-                pm = model.posterior_mean()
-            except Exception:
-                # fallback to zeros (safe)
-                return np.zeros(dim)
-            arr = np.asarray(pm)
-            if arr.ndim == 0:
-                # scalar -> treat as intercept-only weight
-                return arr.reshape(1)
-            return arr.reshape(-1)
-
+        # Robust evaluation policy function (deterministic greedy on posterior means & belief mean)
         def eval_action_fn(x):
-            """
-            Compute deterministic greedy action for context x using:
-              pred = posterior_mean_theta^T x  (with safe alignment rules)
-              + pb_weight * progressive_belief_mean (posterior)
-            Robust to dimension mismatches:
-              - if theta length == len(x): dot directly
-              - if theta length == 1: treat as intercept weight times x[0]
-              - if theta shorter: pad with zeros on the right
-              - if theta longer: truncate to len(x)
-            """
             x = np.asarray(x).reshape(-1)
             best_val = -np.inf
             best_arm = None
             for a in arms:
-                # safe theta mean
+                # safe posterior mean for linear model
                 try:
-                    model = last_trained_agent.models[a]
-                    theta = _safe_posterior_mean(model)
+                    theta = _safe_posterior_mean_of_model(last_trained_agent.models[a], x.size)
                 except Exception:
-                    # if something is wrong, assume zeros
-                    theta = np.zeros(1)
+                    theta = np.zeros(x.size, dtype=float)
 
-                # align theta and x sizes
+                # align and compute prediction
                 if theta.size == x.size:
                     pred = float(theta @ x)
                 elif theta.size == 1:
-                    # interpret as intercept-only weight (multiply with first element)
                     pred = float(theta[0] * x[0])
                 elif theta.size < x.size:
-                    # pad theta on the right with zeros
                     tmp = np.zeros_like(x)
                     tmp[: theta.size] = theta
                     pred = float(tmp @ x)
-                else:  # theta.size > x.size
+                else:  # theta larger
                     pred = float(theta[: x.size] @ x)
 
-                # get progressive belief posterior mean safely
                 pb_mean = 0.0
                 try:
                     bel = last_trained_agent.beliefs[a]
-                    # ensure posterior up to agent.t
                     try:
-                        # If belief exposes compute_posterior, keep it up-to-date
                         if getattr(bel, "has_new_obs", False) or getattr(bel, "t_post", None) != getattr(last_trained_agent, "t", None):
                             bel.compute_posterior(getattr(last_trained_agent, "t", 0))
                     except Exception:
-                        # ignore posterior compute errors and use stored mean if any
                         pass
                     pb_mean = float(getattr(bel, "mean", 0.0))
                 except Exception:
@@ -239,9 +371,9 @@ for n in n_actions_choices:
                     best_arm = a
             return best_arm
 
-        # 4) Compute OPE metrics (IPS/SNIPS/DM/DR)
+        # Run OPE
         metrics = evaluate_offline(
-            dataset=logged_data,
+            dataset=last_logged_data,
             arms=arms,
             eval_action_fn=eval_action_fn,
             dm_model=dm_model,
@@ -250,12 +382,13 @@ for n in n_actions_choices:
             n_boot=500,
         )
 
+        # Present OPE summary
         print("\n=== OFFLINE POLICY EVALUATION (OPE) ===")
-        for k, v in metrics.items():
-            if k != "diagnostics":
+        for k_metric, v_metric in metrics.items():
+            if k_metric != "diagnostics":
                 print(
-                    f"{name} | {k}: {v['value']:.6f}  "
-                    f"(boot mean {v['boot_mean']:.6f}, CI95 {v['ci95'][0]:.6f} .. {v['ci95'][1]:.6f})"
+                    f"{name} | {k_metric}: {v_metric['value']:.6f}  "
+                    f"(boot mean {v_metric['boot_mean']:.6f}, CI95 {v_metric['ci95'][0]:.6f} .. {v_metric['ci95'][1]:.6f})"
                 )
         diag = metrics.get("diagnostics", {})
         print(
@@ -264,7 +397,9 @@ for n in n_actions_choices:
         )
         print()
 
-# === Plotting: preserve original plot of average cumulative regret ===
+# ----------------------------
+# Plot average cumulative regret (same visualization as before)
+# ----------------------------
 xs = np.arange(1, horizon + 1)
 plt.figure(figsize=(10, 6))
 
