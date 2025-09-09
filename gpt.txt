@@ -1,6 +1,83 @@
-Downloading / loading Open Bandit Dataset (policy=random, campaign=all) ...
-Loaded dataset; n_rounds: 10000
-Traceback (most recent call last):
-  File "/home/pritam/contextual-bandit/obd_pipeline.py", line 132, in <module>
+
+from obp.dataset import OpenBanditDataset
+
+# Your project imports (make sure this package is importable)
+from impatient_bandits import (
+    ProgressiveBelief,
+    EmpiricalDistribution,
+    Environment,
+    StickinessHelper,
+    ContextualBayesianBandit,
+    evaluate_offline,
+    DirectMethodModel,
+    LoggedStep
+)
+
+# # OPE helpers from your codebase (adjust import path if different)
+# from impatient_contextual.ope import (
+#     SoftmaxLoggingPolicy,
+#     collect_logged_data,
+#     DirectMethodModel,
+#     evaluate_offline,
+#     LoggedStep,
+# )
+
+# -------------------------------
+# USER-TUNABLE PARAMETERS
+# -------------------------------
+DATA_DIR = Path("./obd")                 # where OBP will download/store the dataset
+OUTPUT_DIR = Path("./data")              # where results/agents/plots are saved
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+CAMPAIGN = "all"                         # OBP campaigns: 'all', 'men', 'women'
+BEHAVIOR_POLICY_TO_DOWNLOAD = "random"   # raw logs to download: 'random' or 'bts'
+W = 30                                   # stickiness window days (choose 30 or 59)
+TOP_N_ITEMS = 200                        # keep top-N frequent items to ensure sufficient traces
+MIN_TRACES_PER_ITEM = 50                 # require at least this many starting impressions per item
+PROP_MC = 500                            # MC draws to estimate Thompson propensities (500-2000)
+HORIZON = 180                            # how many rounds to simulate per trial (matching earlier)
+N_TRIALS = 3                             # number of repeated trials (kept small)
+CONTEXT_DIM = 4                          # if dataset contexts absent, we'll fallback to this + intercept
+SEED = 1
+
+rng = np.random.default_rng(SEED)
+
+# -------------------------------
+# Step 0: helper utilities
+# -------------------------------
+def ensure_obd_downloaded(behavior_policy: str, campaign: str, data_path: Path):
+    """
+    Use OBP OpenBanditDataset to download & preprocess the requested campaign data.
+    This uses the OpenBanditDataset class which will download CSVs to data_path if needed.
+    """
+    print(f"Downloading / loading Open Bandit Dataset (policy={behavior_policy}, campaign={campaign}) ...")
+    dataset = OpenBanditDataset(behavior_policy=behavior_policy, campaign=campaign, data_path=data_path)
+    # obtain_bandit: will load and preprocess; returns dict of arrays
+    bandit_feedback = dataset.obtain_batch_bandit_feedback()
+    # raw DataFrame for fine-grained trace construction:
+    raw_df = dataset.data  # dataframe with timestamp/item_id/user_id/reward etc.
+    print("Loaded dataset; n_rounds:", bandit_feedback.get("n_rounds", None))
+    return dataset, bandit_feedback, raw_df
+
+def to_day_bucket(ts_series):
+    """
+    Convert a timestamp series (seconds) into integer day buckets relative to min timestamp.
+    OBP timestamps are UNIX-like integers; if not, this function will try to coerce.
+    """
+    # safe conversion
+    try:
+        ts = pd.to_datetime(ts_series, unit="s")
+    except Exception:
+        ts = pd.to_datetime(ts_series)
+    days = (ts - ts.min()).dt.days
+    return days.values
+
+# -------------------------------
+# Step 1: Load OBD and inspect repeats
+# -------------------------------
+dataset, bandit_feedback, raw_df = ensure_obd_downloaded(BEHAVIOR_POLICY_TO_DOWNLOAD, CAMPAIGN, DATA_DIR)
+
+# Ensure expected columns exist
+expected_cols = {"user_id", "item_id", "timestamp", "reward"}
+if not expected_cols.issubset(set(raw_df.columns)):
     raise RuntimeError(f"Unexpected raw data columns: missing {expected_cols - set(raw_df.columns)}")
-RuntimeError: Unexpected raw data columns: missing {'user_id', 'reward'}
