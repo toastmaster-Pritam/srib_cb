@@ -1,21 +1,6 @@
-import pandas as pd
-
-# ---- Monkey patch for OBP compatibility with pandas >= 2.0 ----
-if pd.__version__.startswith(("2", "3")):
-    # Patch DataFrame.drop
-    old_drop = pd.DataFrame.drop
-    def new_drop(self, labels=None, axis=0, *args, **kwargs):
-        if args:
-            axis = args[0]
-        return old_drop(self, labels=labels, axis=axis, **kwargs)
-    pd.DataFrame.drop = new_drop
-
-    # Patch pd.concat
-    old_concat = pd.concat
-    def new_concat(objs, *args, **kwargs):
-        if args:
-            # If they passed axis positionally (like 1), map it
-            kwargs["axis"] = args[0]
-        return old_concat(objs, **kwargs)
-    pd.concat = new_concat
-# ---------------------------------------------------------------
+Downloading / loading Open Bandit Dataset (policy=random, campaign=all) ...
+Loaded dataset; n_rounds: 10000
+Traceback (most recent call last):
+  File "/home/pritam/contextual-bandit/obd_pipeline.py", line 132, in <module>
+    raise RuntimeError(f"Unexpected raw data columns: missing {expected_cols - set(raw_df.columns)}")
+RuntimeError: Unexpected raw data columns: missing {'user_id', 'reward'}
