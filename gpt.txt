@@ -1,54 +1,28 @@
- pip install "numpy<1.24" --force-reinstall
-Defaulting to user installation because normal site-packages is not writeable
-Collecting numpy<1.24
-  Using cached numpy-1.23.5.tar.gz (10.7 MB)
-  Installing build dependencies ... done
-  Getting requirements to build wheel ... error
-  error: subprocess-exited-with-error
-  
-  × Getting requirements to build wheel did not run successfully.
-  │ exit code: 1
-  ╰─> [33 lines of output]
-      Traceback (most recent call last):
-        File "/home/pritam/.local/lib/python3.12/site-packages/pip/_vendor/pyproject_hooks/_in_process/_in_process.py", line 389, in <module>
-          main()
-        File "/home/pritam/.local/lib/python3.12/site-packages/pip/_vendor/pyproject_hooks/_in_process/_in_process.py", line 373, in main
-          json_out["return_val"] = hook(**hook_input["kwargs"])
-                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        File "/home/pritam/.local/lib/python3.12/site-packages/pip/_vendor/pyproject_hooks/_in_process/_in_process.py", line 137, in get_requires_for_build_wheel
-          backend = _build_backend()
-                    ^^^^^^^^^^^^^^^^
-        File "/home/pritam/.local/lib/python3.12/site-packages/pip/_vendor/pyproject_hooks/_in_process/_in_process.py", line 70, in _build_backend
-          obj = import_module(mod_path)
-                ^^^^^^^^^^^^^^^^^^^^^^^
-        File "/usr/local/lib/python3.12/importlib/__init__.py", line 90, in import_module
-          return _bootstrap._gcd_import(name[level:], package, level)
-                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        File "<frozen importlib._bootstrap>", line 1387, in _gcd_import
-        File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
-        File "<frozen importlib._bootstrap>", line 1310, in _find_and_load_unlocked
-        File "<frozen importlib._bootstrap>", line 488, in _call_with_frames_removed
-        File "<frozen importlib._bootstrap>", line 1387, in _gcd_import
-        File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
-        File "<frozen importlib._bootstrap>", line 1331, in _find_and_load_unlocked
-        File "<frozen importlib._bootstrap>", line 935, in _load_unlocked
-        File "<frozen importlib._bootstrap_external>", line 995, in exec_module
-        File "<frozen importlib._bootstrap>", line 488, in _call_with_frames_removed
-        File "/tmp/pip-build-env-envhapxw/overlay/lib/python3.12/site-packages/setuptools/__init__.py", line 16, in <module>
-          import setuptools.version
-        File "/tmp/pip-build-env-envhapxw/overlay/lib/python3.12/site-packages/setuptools/version.py", line 1, in <module>
-          import pkg_resources
-        File "/tmp/pip-build-env-envhapxw/overlay/lib/python3.12/site-packages/pkg_resources/__init__.py", line 2172, in <module>
-          register_finder(pkgutil.ImpImporter, find_on_path)
-                          ^^^^^^^^^^^^^^^^^^^
-      AttributeError: module 'pkgutil' has no attribute 'ImpImporter'. Did you mean: 'zipimporter'?
-      [end of output]
-  
-  note: This error originates from a subprocess, and is likely not a problem with pip.
-error: subprocess-exited-with-error
+if pd.__version__.startswith(("2","3")):
+    old_drop=pd.DataFrame.drop
+    def new_drop(self,labels=None,axis=0,index=None,columns=None,level=None,inplace=False,errors='raise'):
+        if isinstance(axis,(int,str)):
+            return old_drop(self,labels=labels,axis=axis,index=index,columns=columns,level=level,inplace=inplace,errors=errors)
+        return old_drop(self,labels=labels,axis=axis,index=index,columns=columns,level=level,inplace=inplace,errors=errors)
 
-× Getting requirements to build wheel did not run successfully.
-│ exit code: 1
-╰─> See above for output.
+I added this code after importing pandas and other necessary libraries
 
-note: This error originates from a subprocess, and is likely not a problem with pip.
+then i imported:
+from obp.dataset import OpenBanditDataset
+but still after running the script i got:
+
+Downloading / loading Open Bandit Dataset (policy=random, campaign=all) ...
+Traceback (most recent call last):
+  File "/home/pritam/contextual-bandit/obd_pipeline.py", line 113, in <module>
+    dataset, bandit_feedback, raw_df = ensure_obd_downloaded(BEHAVIOR_POLICY_TO_DOWNLOAD, CAMPAIGN, DATA_DIR)
+                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/pritam/contextual-bandit/obd_pipeline.py", line 89, in ensure_obd_downloaded
+    dataset = OpenBanditDataset(behavior_policy=behavior_policy, campaign=campaign, data_path=data_path)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<string>", line 7, in __init__
+  File "/home/pritam/.local/lib/python3.12/site-packages/obp/dataset/real.py", line 92, in __post_init__
+    self.pre_process()
+  File "/home/pritam/.local/lib/python3.12/site-packages/obp/dataset/real.py", line 192, in pre_process
+    item_feature_cat = self.item_context.drop("item_feature_0", 1).apply(
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: DataFrame.drop() takes from 1 to 2 positional arguments but 3 were given
