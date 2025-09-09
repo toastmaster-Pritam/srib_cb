@@ -1,15 +1,21 @@
-Downloading / loading Open Bandit Dataset (policy=random, campaign=all) ...
-Traceback (most recent call last):
-  File "/home/pritam/contextual-bandit/obd_pipeline.py", line 117, in <module>
-    dataset, bandit_feedback, raw_df = ensure_obd_downloaded(BEHAVIOR_POLICY_TO_DOWNLOAD, CAMPAIGN, DATA_DIR)
-                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/pritam/contextual-bandit/obd_pipeline.py", line 93, in ensure_obd_downloaded
-    dataset = OpenBanditDataset(behavior_policy=behavior_policy, campaign=campaign, data_path=data_path)
-              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "<string>", line 7, in __init__
-  File "/home/pritam/.local/lib/python3.12/site-packages/obp/dataset/real.py", line 92, in __post_init__
-    self.pre_process()
-  File "/home/pritam/.local/lib/python3.12/site-packages/obp/dataset/real.py", line 195, in pre_process
-    self.action_context = pd.concat([item_feature_cat, item_feature_0], 1).values
-                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-TypeError: concat() takes 1 positional argument but 2 were given
+import pandas as pd
+
+# ---- Monkey patch for OBP compatibility with pandas >= 2.0 ----
+if pd.__version__.startswith(("2", "3")):
+    # Patch DataFrame.drop
+    old_drop = pd.DataFrame.drop
+    def new_drop(self, labels=None, axis=0, *args, **kwargs):
+        if args:
+            axis = args[0]
+        return old_drop(self, labels=labels, axis=axis, **kwargs)
+    pd.DataFrame.drop = new_drop
+
+    # Patch pd.concat
+    old_concat = pd.concat
+    def new_concat(objs, *args, **kwargs):
+        if args:
+            # If they passed axis positionally (like 1), map it
+            kwargs["axis"] = args[0]
+        return old_concat(objs, **kwargs)
+    pd.concat = new_concat
+# ---------------------------------------------------------------
