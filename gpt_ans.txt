@@ -1,127 +1,144 @@
-# ---------------------
-    # Simulation runner (single trial) - uses context_instances or generate based on selected_features
-    # ---------------------
-    def simulate_and_log(self, horizon: int = 180, n_actions: int = 3, propensity_mc: int = 500, selected_instance_ids: Optional[List[int]] = None, context_mode: str = "random", fresh_agent: bool = True) -> Tuple[np.ndarray, np.ndarray, List[SimpleLoggedStep]]:
-        """
-        Single simulated trial:
-         - if selected_instance_ids provided: contexts are drawn from those instances (round-robin or random)
-         - else if context_instances exist: sample from pool
-         - else generate contexts from selected_features generators
-        Returns (regrets_array, entropies_array, logged_entries_for_run)
-        """
-        if self.env is None:
-            raise RuntimeError("No environment (eval pkl) available for sampling traces.")
+"""
+api.py - FastAPI endpoints for the ModelService with feature-pool and context-instance support.
 
-        if fresh_agent or self.agent is None:
-            self.create_fresh_agent(ProgressiveBelief)
+Run:
+    uvicorn api:app --reload
+"""
 
-        agent = self.agent
-        arms = list(self.env.dists.keys())
-        logged_run: List[SimpleLoggedStep] = []
-        regrets = []
-        entropies = []
-        rng_local = np.random.default_rng(int(self.rng.integers(0, 2 ** 31 - 1)))
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import List, Optional, Any, Dict
+import uvicorn
 
-        # build sequence of context vectors
-        ctx_seq = []
-        if selected_instance_ids:
-            ids = [int(i) for i in selected_instance_ids]
-            if context_mode == "round-robin":
-                for i in range(horizon):
-                    inst = self.context_instances[ids[i % len(ids)]]
-                    ctx_seq.append(self.build_full_vector_from_instance(inst))
-            else:
-                for i in range(horizon):
-                    inst = self.context_instances[ids[rng_local.integers(0, len(ids))]]
-                    ctx_seq.append(self.build_full_vector_from_instance(inst))
-        elif len(self.context_instances) > 0:
-            if context_mode == "round-robin":
-                for i in range(horizon):
-                    inst = self.context_instances[i % len(self.context_instances)]
-                    ctx_seq.append(self.build_full_vector_from_instance(inst))
-            else:
-                for i in range(horizon):
-                    inst = self.context_instances[rng_local.integers(0, len(self.context_instances))]
-                    ctx_seq.append(self.build_full_vector_from_instance(inst))
+from model_service import ModelService
+
+app = FastAPI(title="ContextualBanditModelAPI")
+svc = ModelService()
+
+# -------------------------
+# Request models
+# -------------------------
+class SelectFeaturesReq(BaseModel):
+    features: List[str]
+
+class InstanceReq(BaseModel):
+    instance: Dict[str, Any]
+
+class MultipleInstancesReq(BaseModel):
+    instances: List[Dict[str, Any]]
+
+class PredictInstanceReq(BaseModel):
+    instance_id: Optional[int] = None
+    instance: Optional[Dict[str, Any]] = None
+    n_actions: Optional[int] = 1
+    stochastic: Optional[bool] = False
+
+class SimulateReq(BaseModel):
+    instance_ids: Optional[List[int]] = None
+    horizon: Optional[int] = 60
+    n_actions: Optional[int] = 3
+    n_trials: Optional[int] = 3
+    context_mode: Optional[str] = "random"
+    propensity_mc: Optional[int] = 500
+
+class UpdateEntry(BaseModel):
+    a: Any
+    trace: List[int]
+    context: Optional[Dict[str, Any]] = None
+    instance_id: Optional[int] = None
+    t: Optional[int] = None
+    p_b: Optional[float] = 0.0
+
+class UpdateBatchReq(BaseModel):
+    updates: List[UpdateEntry]
+
+# -------------------------
+# Endpoints
+# -------------------------
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.get("/features")
+def get_features():
+    try:
+        return {"features": svc.get_feature_pool(), "selected": svc.get_selected_features()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/select_features")
+def set_selected_features(req: SelectFeaturesReq):
+    try:
+        svc.set_selected_features(req.features)
+        return {"selected": svc.get_selected_features()}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/instances")
+def get_instances():
+    try:
+        return {"instances": svc.get_context_instances()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/instances")
+def add_instance(req: InstanceReq):
+    try:
+        idx = svc.add_context_instance(req.instance)
+        return {"instance_id": idx}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/generate_instances")
+def generate_instances(n: int = 5):
+    try:
+        ids = svc.generate_random_instances(n=n)
+        return {"added_ids": ids}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/predict_instance")
+def predict_instance(req: PredictInstanceReq):
+    try:
+        if req.instance_id is not None:
+            actions = svc.predict(instance_id=req.instance_id, n_actions=req.n_actions, stochastic=req.stochastic)
+        elif req.instance is not None:
+            actions = svc.predict(instance=req.instance, n_actions=req.n_actions, stochastic=req.stochastic)
         else:
-            # generate on the fly using selected_features generators
-            for i in range(horizon):
-                inst = {}
-                for f in self.selected_features:
-                    gen = FEATURE_GENERATORS.get(f)
-                    inst[f] = gen(self.rng) if gen is not None else 0.0
-                ctx_seq.append(self.build_full_vector_from_instance(inst))
+            actions = svc.predict(n_actions=req.n_actions, stochastic=req.stochastic)
+        return {"actions": actions}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-        for t in range(horizon):
-            x = np.asarray(ctx_seq[t]).reshape(-1)
-            actions = agent.act(x, n_actions=n_actions)
-            # estimate propensities
-            try:
-                probas = self.estimate_thompson_probas(x, B=propensity_mc)
-            except Exception:
-                probas = {a: 1.0 / len(arms) for a in arms}
+@app.post("/simulate")
+def simulate(req: SimulateReq):
+    try:
+        res = svc.simulate_trials(n_trials=req.n_trials, horizon=req.horizon, n_actions=req.n_actions, propensity_mc=req.propensity_mc, selected_instance_ids=req.instance_ids, context_mode=req.context_mode)
+        return {
+            "cumavg_mean": res["cumavg_mean"].tolist(),
+            "cumavg_std": res["cumavg_std"].tolist(),
+            "regrets_shape": list(res["regrets"].shape),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-            for a in actions:
-                p_b = max(probas.get(a, 1e-12), 1e-12)
-                trace = self.env.step(a, t, n_samples=1, context=x)  # returns (1,w)
-                trace = np.atleast_2d(trace)
-                r = float(1.0 + trace.sum())
-                entry = SimpleLoggedStep(x=x.copy(), a=a, r=r, p_b=p_b, t=t, ctx_id=None)
-                logged_run.append(entry)
-                try:
-                    agent.update(a, trace, x)
-                except Exception:
-                    try:
-                        agent.beliefs[a].update(trace, t)
-                        agent.models[a].update(x, r)
-                    except Exception:
-                        pass
-            agent.step()
-            try:
-                true_rewards = np.array([1.0 + self.empirical_means[a].sum() for a in actions])
-                r_opt = max(1.0 + v.sum() for v in self.empirical_means.values())
-            except Exception:
-                true_rewards = np.zeros(len(actions), dtype=float)
-                r_opt = 0.0
-            regrets.append(float(np.mean(r_opt - true_rewards)))
-            _, counts = np.unique(actions, return_counts=True)
-            probs = counts / counts.sum()
-            entropies.append(float(-np.sum(probs * np.log(probs + 1e-12))))
-        # append to global log
-        self.logged.extend(logged_run)
-        return np.array(regrets), np.array(entropies), logged_run
+@app.post("/update_batch")
+def update_batch(req: UpdateBatchReq):
+    try:
+        updates = [u.dict() for u in req.updates]
+        n = svc.batch_update(updates, log=True)
+        return {"updated": n}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    def simulate_trials(self, n_trials: int = 3, horizon: int = 180, n_actions: int = 3, propensity_mc: int = 500, selected_instance_ids: Optional[List[int]] = None, context_mode: str = "random") -> Dict[str, Any]:
-        all_regrets = []
-        for i in range(n_trials):
-            self.agent = None
-            reg, ent, logs = self.simulate_and_log(horizon=horizon, n_actions=n_actions, propensity_mc=propensity_mc, selected_instance_ids=selected_instance_ids, context_mode=context_mode, fresh_agent=True)
-            all_regrets.append(reg)
-        arr = np.vstack(all_regrets)
-        xs = np.arange(1, arr.shape[1] + 1)
-        cumavg = np.cumsum(arr, axis=1) / xs
-        mean = np.mean(cumavg, axis=0)
-        std = np.std(cumavg, axis=0)
-        return {"regrets": arr, "cumavg_mean": mean, "cumavg_std": std}
-
-    # ---------------------
-    # OPE wrapper
-    # ---------------------
-    def compute_ope(self, eval_agent=None, clip=10.0, snips=True, n_boot: int = 200):
-        if len(self.logged) == 0:
-            raise RuntimeError("No logged data to evaluate")
-        dataset = self.logged
-        arms = list(self.env.dists.keys()) if self.env is not None else list(self.agent.arms)
-        dm_model = DirectMethodModel(arms=arms, dim=self.context_dim + 1, alpha=1.0, sigma2=self.sigma2)
-        dm_model.fit(dataset)
-        if eval_agent is None:
-            eval_agent = self.agent
-
-        def eval_action_fn(x):
-            x = np.asarray(x).reshape(-1)
-            return self.greedy_action(x, n_actions=1)[0]
-
-        metrics = evaluate_offline(dataset=dataset, arms=arms, eval_action_fn=eval_action_fn, dm_model=dm_model, clip=clip, snips=snips, n_boot=n_boot)
+@app.get("/ope")
+def ope(n_boot: int = 200):
+    try:
+        metrics = svc.compute_ope(n_boot=n_boot)
         return metrics
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-# EOF
+# dev-run
+if __name__ == "__main__":
+    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)
