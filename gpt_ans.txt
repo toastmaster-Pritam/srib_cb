@@ -1,59 +1,129 @@
-# compute regret diagnostic (use empirical_means)
-            try:
-                true_rewards = np.array([1.0 + self.empirical_means[a].sum() for a in actions])
-                r_opt = max(1.0 + v.sum() for v in self.empirical_means.values())
-            except Exception:
-                # fallback: treat 0
-                true_rewards = np.zeros(len(actions), dtype=float)
-                r_opt = 0.0
-            regrets.append(float(np.mean(r_opt - true_rewards)))
-            _, counts = np.unique(actions, return_counts=True)
-            probs = counts / counts.sum()
-            entropies.append(float(-np.sum(probs * np.log(probs + 1e-12))))
+"""
+api.py - FastAPI endpoints to serve model predictions and run simulations.
 
-        # append logged_run to global log
-        self.logged.extend(logged_run)
-        return np.array(regrets), np.array(entropies), logged_run
+Run with:
+    uvicorn api:app --reload --host 0.0.0.0 --port 8000
+"""
 
-    # ---------------------
-    # Multi-trial simulate to compute mean/std regret curves
-    # ---------------------
-    def simulate_trials(self, n_trials: int = 3, horizon: int = 180, n_actions: int = 3, propensity_mc: int = 500, selected_context_ids: Optional[List[int]] = None, context_mode: str = "random") -> Dict[str, Any]:
-        """
-        Run multiple independent trials (fresh agent for each) and return aggregated regret statistics.
-        Returns dict with keys: 'regrets' (n_trials x horizon), 'mean_cum_regret' (horizon,), 'std_cum_regret' (horizon,)
-        """
-        all_regrets = []
-        for i in range(n_trials):
-            # clear agent and use fresh agent to ensure independent trials
-            self.agent = None
-            reg, ent, logged_run = self.simulate_and_log(horizon=horizon, n_actions=n_actions, propensity_mc=propensity_mc, selected_context_ids=selected_context_ids, context_mode=context_mode, fresh_agent=True)
-            all_regrets.append(reg)
-        arr = np.vstack(all_regrets)  # (n_trials, horizon)
-        # compute cumulative average regret per trial, then mean/std across trials
-        xs = np.arange(1, arr.shape[1] + 1)
-        cumavg = np.cumsum(arr, axis=1) / xs
-        mean = np.mean(cumavg, axis=0)
-        std = np.std(cumavg, axis=0)
-        return {"regrets": arr, "cumavg_mean": mean, "cumavg_std": std}
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import List, Optional, Any
+import uvicorn
+import numpy as np
 
-    # ---------------------
-    # OPE wrapper
-    # ---------------------
-    def compute_ope(self, eval_agent=None, clip=10.0, snips=True, n_boot: int = 200):
-        if len(self.logged) == 0:
-            raise RuntimeError("No logged data available")
-        dataset = self.logged
-        arms = list(self.env.dists.keys()) if self.env is not None else list(self.agent.arms)
-        dm_model = DirectMethodModel(arms=arms, dim=self.context_dim + 1, alpha=1.0, sigma2=self.sigma2)
-        dm_model.fit(dataset)
-        if eval_agent is None:
-            eval_agent = self.agent
+from model_service import ModelService
 
-        def eval_action_fn(x):
-            x = np.asarray(x).reshape(-1)
-            # use greedy selection
-            return self.greedy_action(x, n_actions=1)[0]
+app = FastAPI(title="Contextual Bandit API")
+svc = ModelService()  # single instance for admin usage
 
-        metrics = evaluate_offline(dataset=dataset, arms=arms, eval_action_fn=eval_action_fn, dm_model=dm_model, clip=clip, snips=snips, n_boot=n_boot)
+# -------------------------
+# Request / Response models
+# -------------------------
+class PredictByIdReq(BaseModel):
+    context_id: int
+    n_actions: Optional[int] = 1
+    stochastic: Optional[bool] = False
+
+class PredictReq(BaseModel):
+    context: Optional[List[float]] = None
+    context_id: Optional[int] = None
+    n_actions: Optional[int] = 1
+    stochastic: Optional[bool] = False
+
+class SimulateReq(BaseModel):
+    context_ids: Optional[List[int]] = None
+    horizon: Optional[int] = 60
+    n_actions: Optional[int] = 3
+    n_trials: Optional[int] = 3
+    context_mode: Optional[str] = "random"  # or "round-robin"
+    propensity_mc: Optional[int] = 500
+
+class UpdateEntry(BaseModel):
+    a: Any
+    trace: List[int]
+    context: Optional[Any] = None
+    t: Optional[int] = None
+    p_b: Optional[float] = 0.0
+    ctx_id: Optional[int] = None
+
+class UpdateBatchReq(BaseModel):
+    updates: List[UpdateEntry]
+
+# -------------------------
+# Endpoints
+# -------------------------
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.get("/contexts")
+def get_contexts():
+    try:
+        return {"contexts": svc.get_context_pool()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/predict_by_id")
+def predict_by_id(req: PredictByIdReq):
+    try:
+        actions = svc.predict(context_id=req.context_id, n_actions=req.n_actions, stochastic=req.stochastic)
+        return {"actions": actions}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/predict")
+def predict(req: PredictReq):
+    try:
+        if req.context_id is not None:
+            actions = svc.predict(context_id=req.context_id, n_actions=req.n_actions, stochastic=req.stochastic)
+        elif req.context is not None:
+            actions = svc.predict(context=req.context, n_actions=req.n_actions, stochastic=req.stochastic)
+        else:
+            actions = svc.predict(n_actions=req.n_actions, stochastic=req.stochastic)
+        return {"actions": actions}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/simulate_with_contexts")
+def simulate(req: SimulateReq):
+    try:
+        context_ids = req.context_ids
+        # run multi-trial simulate
+        res = svc.simulate_trials(n_trials=req.n_trials, horizon=req.horizon, n_actions=req.n_actions, propensity_mc=req.propensity_mc, selected_context_ids=context_ids, context_mode=req.context_mode)
+        # convert numpy arrays to lists for json
+        return {
+            "cumavg_mean": res["cumavg_mean"].tolist(),
+            "cumavg_std": res["cumavg_std"].tolist(),
+            "regrets_shape": list(res["regrets"].shape),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/update_batch")
+def update_batch(req: UpdateBatchReq):
+    try:
+        updates = [u.dict() for u in req.updates]
+        n = svc.batch_update(updates, log=True)
+        return {"updated": n}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/ope")
+def ope(n_boot: int = 200):
+    try:
+        metrics = svc.compute_ope(n_boot=n_boot)
+        # convert numpy objects to floats/lists where needed
+        for k, v in list(metrics.items()):
+            if isinstance(v, dict):
+                for kk in ["value", "boot_mean"]:
+                    if kk in v:
+                        v[kk] = float(v[kk])
+                if "ci95" in v:
+                    v["ci95"] = [float(x) for x in v["ci95"]]
         return metrics
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# Quick dev-run
+if __name__ == "__main__":
+    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)
