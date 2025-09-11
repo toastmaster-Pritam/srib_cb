@@ -1,101 +1,199 @@
-import os
-import pickle
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+class ModelService:
+    def __init__(
+        self,
+        train_pkl: str = "data/synthetic-data-train.pkl",
+        eval_pkl: str = "data/synthetic-data-eval.pkl",
+        context_dim: int = 4,
+        pb_weight: float = 0.6,
+        sigma2: float = 0.25,
+        rng_seed: int = 1,
+    ):
+        self.train_pkl = train_pkl
+        self.eval_pkl = eval_pkl
+        self.context_dim = int(context_dim)
+        self.pb_weight = float(pb_weight)
+        self.sigma2 = float(sigma2)
+        self.rng = np.random.default_rng(int(rng_seed))
 
-import numpy as np
+        self.helper: Optional[StickinessHelper] = None
+        self.env: Optional[Environment] = None
+        self.item_traces: Optional[Dict[str, np.ndarray]] = None
+        self.empirical_means: Optional[Dict[str, np.ndarray]] = None
+        self.agent: Optional[ContextualBayesianBandit] = None
 
-# Try importing experiment modules (tolerant)
-try:
-    from impatient_bandits import (
-        ContextualBayesianBandit,
-        ProgressiveBelief,
-        EmpiricalDistribution,
-        Environment,
-        StickinessHelper,
-    )
-    try:
-        from impatient_bandits import DirectMethodModel, evaluate_offline, LoggedStep  # type: ignore
-    except Exception:
-        from impatient_contextual.ope import DirectMethodModel, evaluate_offline, LoggedStep  # type: ignore
-except Exception:
-    try:
-        from impatient_contextual.contextual_bandit import ContextualBayesianBandit  # type: ignore
-        from impatient_contextual.belief import ProgressiveBelief  # type: ignore
-        from impatient_contextual.data import EmpiricalDistribution  # type: ignore
-        from impatient_contextual.env import Environment  # type: ignore
-        from impatient_contextual.helper import StickinessHelper  # type: ignore
-        from impatient_contextual.ope import DirectMethodModel, evaluate_offline, LoggedStep  # type: ignore
-    except Exception as e:
-        raise ImportError(f"Could not import experiment modules: {e}")
+        # feature/instance state
+        self.canonical_features = CANONICAL_FEATURES.copy()
+        self.selected_features: List[str] = CANONICAL_FEATURES[:4]
+        self.context_instances: List[Dict[str, Any]] = []
 
-# Logged entry
-@dataclass
-class SimpleLoggedStep:
-    x: np.ndarray
-    a: Any
-    r: float
-    p_b: float
-    t: int
-    ctx_id: Optional[int] = None
+        # trace-related
+        self.w: Optional[int] = None
+        self.day_decay: Optional[np.ndarray] = None
+        self.true_theta: Optional[Dict[str, np.ndarray]] = None
 
-# Canonical feature pool (order matters)
-CANONICAL_FEATURES = [
-    "age",
-    "device_mobile",
-    "recent_eng",
-    "premium",
-    "time_of_day",
-    "watch_time",
-    "session_length",
-    "is_weekend",
-    "location_norm",
-    "hour_of_day",
-]
+        # logging
+        self.logged: List[SimpleLoggedStep] = []
 
-# Generators for canonical features (used to fill defaults)
-def _gen_age(rng): return float(rng.uniform(0, 1))
-def _gen_mobile(rng): return int(rng.binomial(1, 0.6))
-def _gen_recent_eng(rng): return float(np.tanh(rng.exponential(1.0) / 2.0))
-def _gen_premium(rng): return int(rng.binomial(1, 0.2))
-def _gen_time_of_day(rng): return float(rng.uniform(0, 1))
-def _gen_watch_time(rng): return float(np.clip(rng.exponential(0.2), 0.0, 1.0))
-def _gen_session_length(rng): return float(np.clip(rng.exponential(0.5), 0.0, 1.0))
-def _gen_is_weekend(rng): return int(rng.binomial(1, 0.28))
-def _gen_location_norm(rng): return float(rng.integers(0, 100) / 99.0)
-def _gen_hour_of_day(rng): return float(rng.integers(0, 23) / 23.0)
+        # init from pickles
+        self._init_from_pickles()
+        if len(self.context_instances) == 0:
+            self.generate_random_instances(5)
 
-FEATURE_GENERATORS = {
-    "age": _gen_age,
-    "device_mobile": _gen_mobile,
-    "recent_eng": _gen_recent_eng,
-    "premium": _gen_premium,
-    "time_of_day": _gen_time_of_day,
-    "watch_time": _gen_watch_time,
-    "session_length": _gen_session_length,
-    "is_weekend": _gen_is_weekend,
-    "location_norm": _gen_location_norm,
-    "hour_of_day": _gen_hour_of_day,
-}
+    # -------------------
+    # init/load
+    # -------------------
+    def _load_pickle(self, path):
+        with open(path, "rb") as fh:
+            return pickle.load(fh)
 
-def feature_label(name: str) -> str:
-    return name.replace("_", " ").title()
+    def _init_from_pickles(self):
+        # load eval pkl to build env & empirical means
+        if os.path.exists(self.eval_pkl):
+            try:
+                data_eval = self._load_pickle(self.eval_pkl)
+                item_traces = {k: v.astype(float) for k, v in data_eval.items() if v is not None and len(v) > 0}
+                if len(item_traces) > 0:
+                    self.item_traces = item_traces
+                    self.empirical_means = {k: np.mean(v, axis=0) for k, v in item_traces.items()}
+                    # compute w and day_decay
+                    any_arm = next(iter(self.empirical_means.values()))
+                    self.w = any_arm.shape[0]
+                    self.day_decay = np.linspace(1.0, 0.6, self.w)
+                    # env
+                    dists = {}
+                    for uri, traces in item_traces.items():
+                        seed_int = int(self.rng.integers(0, 2 ** 31 - 1))
+                        dists[uri] = EmpiricalDistribution(traces.copy(), seed=seed_int)
+                    self.env = Environment(dists)
+                    # create true_theta mapping same style as main.py
+                    self.true_theta = {uri: self.rng.normal(scale=0.8, size=(self.context_dim + 1,)) for uri in item_traces}
+            except Exception as e:
+                print("Warning: failed to init eval env from pkl:", e)
 
-# Safe vector functions
-def _safe_align_vec(vec: np.ndarray, target_len: int) -> np.ndarray:
-    v = np.asarray(vec).reshape(-1)
-    if v.size == target_len:
-        return v.astype(float)
-    if v.size < target_len:
-        out = np.zeros(target_len, dtype=float)
-        out[: v.size] = v
-        return out
-    return v[:target_len].astype(float)
+        # load training priors
+        if os.path.exists(self.train_pkl):
+            try:
+                train_data = self._load_pickle(self.train_pkl)
+                train_data = {k: v.astype(float) for k, v in train_data.items() if v is not None and len(v) > 0}
+                if len(train_data) > 0:
+                    self.helper = StickinessHelper.from_data(train_data)
+            except Exception as e:
+                print("Warning: failed to init helper from train pkl:", e)
 
-def _safe_posterior_mean_of_model(model, target_len: int) -> np.ndarray:
-    try:
-        pm = model.posterior_mean()
-        arr = np.asarray(pm).reshape(-1)
-    except Exception:
-        return np.zeros(target_len, dtype=float)
-    return _safe_align_vec(arr, target_len)
+    # -------------------
+    # instance utilities
+    # -------------------
+    def _fill_instance_defaults(self, instance: Dict[str, Any]) -> Dict[str, Any]:
+        for f in self.canonical_features:
+            if f not in instance:
+                gen = FEATURE_GENERATORS.get(f)
+                try:
+                    instance[f] = gen(self.rng) if gen is not None else 0.0
+                except Exception:
+                    instance[f] = 0.0
+        return instance
+
+    def add_context_instance(self, ctx: Dict[str, Any]) -> int:
+        inst = dict(ctx)
+        inst = self._fill_instance_defaults(inst)
+        self.context_instances.append(inst)
+        return len(self.context_instances) - 1
+
+    def update_context_instance(self, idx: int, ctx: Dict[str, Any]):
+        if idx < 0 or idx >= len(self.context_instances):
+            raise IndexError("context instance idx out of range")
+        inst = dict(ctx)
+        inst = self._fill_instance_defaults(inst)
+        self.context_instances[idx] = inst
+
+    def remove_context_instance(self, idx: int):
+        if idx < 0 or idx >= len(self.context_instances):
+            raise IndexError("context instance idx out of range")
+        del self.context_instances[idx]
+
+    def get_context_instances(self) -> List[Dict[str, Any]]:
+        return [dict(c) for c in self.context_instances]
+
+    def generate_random_instances(self, n: int = 5, selected_features: Optional[List[str]] = None) -> List[int]:
+        if selected_features is None:
+            selected_features = self.selected_features
+        ids = []
+        for _ in range(n):
+            inst = {}
+            for f in self.canonical_features:
+                gen = FEATURE_GENERATORS.get(f)
+                if f in selected_features and gen is not None:
+                    inst[f] = gen(self.rng)
+                else:
+                    inst[f] = gen(self.rng) if gen is not None else 0.0
+            idx = self.add_context_instance(inst)
+            ids.append(idx)
+        return ids
+
+    # -------------------
+    # feature selection
+    # -------------------
+    def get_feature_pool(self):
+        return [{"name": f, "label": feature_label(f), "selected": f in self.selected_features} for f in self.canonical_features]
+
+    def set_selected_features(self, selected: List[str]):
+        selected = [s for s in selected if s in self.canonical_features]
+        if len(selected) == 0:
+            raise ValueError("At least one feature must be selected")
+        self.selected_features = selected
+        # retrofill existing instances so they have values for all canonical features
+        for inst in self.context_instances:
+            self._fill_instance_defaults(inst)
+
+    def get_selected_features(self):
+        return list(self.selected_features)
+
+    # -------------------
+    # agent lifecycle
+    # -------------------
+    def create_fresh_agent(self, belief_cls=ProgressiveBelief) -> ContextualBayesianBandit:
+        if self.env is None:
+            raise RuntimeError("No environment constructed (need eval pkl).")
+        if self.helper is None:
+            raise RuntimeError("No stickiness helper available (need train pkl).")
+        beliefs = {}
+        for uri in self.env.dists.keys():
+            beliefs[uri] = belief_cls(
+                prior_mvec=self.helper.prior_mvec.copy(),
+                prior_cmat=self.helper.prior_cmat.copy(),
+                noise_cmat=self.helper.noise_cmat.copy(),
+                cov_estimator="fixed",
+                seed=int(self.rng.integers(0, 2 ** 31 - 1)),
+            )
+        agent = ContextualBayesianBandit(beliefs, dim=self.context_dim + 1, alpha=1.0, sigma2=self.sigma2, pb_weight=self.pb_weight, seed=int(self.rng.integers(0, 2 ** 31 - 1)))
+        self.agent = agent
+        return agent
+
+    def load_agent(self, path: str):
+        with open(path, "rb") as fh:
+            self.agent = pickle.load(fh)
+        return self.agent
+
+    def save_agent(self, path: str):
+        if self.agent is None:
+            raise RuntimeError("No agent to save")
+        with open(path, "wb") as fh:
+            pickle.dump(self.agent, fh, protocol=pickle.HIGHEST_PROTOCOL)
+
+    # -------------------
+    # context vector building
+    # -------------------
+    def build_full_vector_from_instance(self, instance: Dict[str, Any]) -> np.ndarray:
+        values = [1.0]
+        for f in self.canonical_features:
+            v = instance.get(f, 0.0)
+            try:
+                values.append(float(v))
+            except Exception:
+                try:
+                    values.append(float(int(v)))
+                except Exception:
+                    values.append(0.0)
+        vec = np.asarray(values, dtype=float).reshape(-1)
+        vec = _safe_align_vec(vec, self.context_dim + 1)
+        return vec
