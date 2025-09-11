@@ -1,476 +1,59 @@
-"""
-model_service.py
-
-Central service that:
- - manages a context pool
- - loads/saves agents (pickles)
- - wraps prediction (greedy / stochastic)
- - runs simulations using a selected context pool and logs interactions
- - exposes compute_ope wrapper
-
-This file is defensive about vector shapes (padding/truncating) to avoid matmul errors.
-"""
-
-import os
-import pickle
-from dataclasses import dataclass, asdict
-from typing import Any, Dict, List, Optional, Tuple
-
-import numpy as np
-
-# Try importing your bandit modules from likely places; be tolerant.
-try:
-    # preferred if you packaged earlier experiments as `impatient_bandits`
-    from impatient_bandits import (
-        ContextualBayesianBandit,
-        ProgressiveBelief,
-        EmpiricalDistribution,
-        Environment,
-        StickinessHelper,
-    )
-    # Also try grabbing OPE helpers
-    try:
-        from impatient_bandits import DirectMethodModel, evaluate_offline, LoggedStep  # type: ignore
-    except Exception:
-        from impatient_contextual.ope import DirectMethodModel, evaluate_offline, LoggedStep  # type: ignore
-except Exception:
-    # fall back to impatient_contextual names (raw modules)
-    try:
-        from impatient_contextual.contextual_bandit import ContextualBayesianBandit  # type: ignore
-        from impatient_contextual.belief import ProgressiveBelief  # type: ignore
-        from impatient_contextual.data import EmpiricalDistribution  # type: ignore
-        from impatient_contextual.env import Environment  # type: ignore
-        from impatient_contextual.helper import StickinessHelper  # type: ignore
-        from impatient_contextual.ope import DirectMethodModel, evaluate_offline, LoggedStep  # type: ignore
-    except Exception as e:
-        raise ImportError(f"Could not import required experiment modules: {e}")
-
-# A lightweight logged-step dataclass compatible with evaluate_offline expectations
-@dataclass
-class SimpleLoggedStep:
-    x: np.ndarray  # context vector (1-D)
-    a: Any         # arm id
-    r: float       # observed scalar reward
-    p_b: float     # behavior propensity
-    t: int         # timestep
-    ctx_id: Optional[int] = None  # optional context id from pool
-
-    # evaluate_offline expects objects with attributes; keep this simple.
-    def to_dict(self):
-        return {
-            "x": np.asarray(self.x).tolist(),
-            "a": self.a,
-            "r": float(self.r),
-            "p_b": float(self.p_b),
-            "t": int(self.t),
-            "ctx_id": int(self.ctx_id) if self.ctx_id is not None else None,
-        }
-
-
-# --------------------------
-# Utility / context helpers
-# --------------------------
-def make_context(rng: np.random.Generator) -> Dict[str, Any]:
-    """Simulated context with the same fields/order as your experiments."""
-    age = float(rng.uniform(0, 1))
-    device_mobile = int(rng.binomial(1, 0.6))
-    recent_eng = float(np.tanh(rng.exponential(1.0) / 2.0))
-    premium = int(rng.binomial(1, 0.2))
-    return {"age": age, "device_mobile": device_mobile, "recent_eng": recent_eng, "premium": premium}
-
-
-def context_to_vector(ctx: Dict[str, Any]) -> np.ndarray:
-    """Convert structured context dict -> numeric vector [1.0, age, device_mobile, recent_eng, premium]."""
-    return np.asarray(
-        [1.0, float(ctx["age"]), int(ctx["device_mobile"]), float(ctx["recent_eng"]), int(ctx["premium"])],
-        dtype=float,
-    )
-
-
-def context_label(ctx: Dict[str, Any]) -> str:
-    """Human readable label for a context."""
-    return f"age={ctx['age']:.2f} mob={ctx['device_mobile']} prem={ctx['premium']} recent={ctx['recent_eng']:.2f}"
-
-
-def _safe_align_vec(vec: np.ndarray, target_len: int) -> np.ndarray:
-    v = np.asarray(vec).reshape(-1)
-    if v.size == target_len:
-        return v.astype(float)
-    if v.size < target_len:
-        out = np.zeros(target_len, dtype=float)
-        out[: v.size] = v
-        return out
-    return v[:target_len].astype(float)
-
-
-def _safe_posterior_mean_of_model(model, target_len: int) -> np.ndarray:
-    try:
-        pm = model.posterior_mean()
-        arr = np.asarray(pm).reshape(-1)
-    except Exception:
-        return np.zeros(target_len, dtype=float)
-    return _safe_align_vec(arr, target_len)
-
-
-# --------------------------
-# ModelService
-# --------------------------
-class ModelService:
-    def __init__(
-        self,
-        train_pkl: str = "data/synthetic-data-train.pkl",
-        eval_pkl: str = "data/synthetic-data-eval.pkl",
-        w: int = 59,
-        context_dim: int = 4,
-        pb_weight: float = 0.6,
-        sigma2: float = 0.25,
-        rng_seed: int = 1,
-    ):
-        self.train_pkl = train_pkl
-        self.eval_pkl = eval_pkl
-        self.w = w
-        self.context_dim = context_dim
-        self.pb_weight = pb_weight
-        self.sigma2 = sigma2
-        self.rng = np.random.default_rng(rng_seed)
-
-        # runtime state
-        self.helper: Optional[StickinessHelper] = None
-        self.env: Optional[Environment] = None
-        self.item_traces: Optional[Dict[str, np.ndarray]] = None
-        self.empirical_means: Optional[Dict[str, np.ndarray]] = None
-        self.agent: Optional[ContextualBayesianBandit] = None
-
-        # logging and context pool
-        self.logged: List[SimpleLoggedStep] = []
-        self.context_pool: List[Dict[str, Any]] = []
-        self._init_from_pickles()
-        if len(self.context_pool) == 0:
-            self.context_pool = [make_context(self.rng) for _ in range(20)]
-
-    def _load_pickle(self, path):
-        with open(path, "rb") as fh:
-            return pickle.load(fh)
-
-    def _init_from_pickles(self):
-        # Load eval pkl to build env if possible
-        if os.path.exists(self.eval_pkl):
+# compute regret diagnostic (use empirical_means)
             try:
-                data_eval = self._load_pickle(self.eval_pkl)
-                # ensure float arrays
-                item_traces = {k: v.astype(float) for k, v in data_eval.items() if v is not None and len(v) > 0}
-                if len(item_traces) > 0:
-                    self.item_traces = item_traces
-                    self.empirical_means = {k: np.mean(v, axis=0) for k, v in item_traces.items()}
-                    # build env from EmpiricalDistribution
-                    dists = {}
-                    for uri, traces in item_traces.items():
-                        seed_int = int(self.rng.integers(0, 2 ** 31 - 1))
-                        dists[uri] = EmpiricalDistribution(traces.copy(), seed=seed_int)
-                    self.env = Environment(dists)
-                # Build helper if train_pkl exists
-                if os.path.exists(self.train_pkl):
-                    train_data = self._load_pickle(self.train_pkl)
-                    train_data = {k: v.astype(float) for k, v in train_data.items() if v is not None and len(v) > 0}
-                    if len(train_data) > 0:
-                        self.helper = StickinessHelper.from_data(train_data)
-            except Exception as e:
-                # non-fatal
-                print("Warning: failed to initialize environment from pickles:", e)
-
-    # ---------------------
-    # Context pool methods
-    # ---------------------
-    def get_context_pool(self) -> List[Dict[str, Any]]:
-        """Return list of dicts with id, label, context fields."""
-        out = []
-        for i, ctx in enumerate(self.context_pool):
-            out.append({"id": i, "label": context_label(ctx), "context": ctx})
-        return out
-
-    def add_context_to_pool(self, ctx: Dict[str, Any]) -> int:
-        self.context_pool.append(ctx)
-        return len(self.context_pool) - 1
-
-    def update_context_in_pool(self, idx: int, ctx: Dict[str, Any]):
-        if idx < 0 or idx >= len(self.context_pool):
-            raise IndexError("context idx out of range")
-        self.context_pool[idx] = ctx
-
-    # ---------------------
-    # Agent lifecycle
-    # ---------------------
-    def create_fresh_agent(self, belief_cls=ProgressiveBelief) -> ContextualBayesianBandit:
-        if self.env is None:
-            raise RuntimeError("No environment constructed (need eval pkl).")
-        if self.helper is None:
-            raise RuntimeError("No stickiness helper available (need train pkl).")
-        beliefs = {}
-        for uri in self.env.dists.keys():
-            beliefs[uri] = belief_cls(
-                prior_mvec=self.helper.prior_mvec.copy(),
-                prior_cmat=self.helper.prior_cmat.copy(),
-                noise_cmat=self.helper.noise_cmat.copy(),
-                cov_estimator="fixed",
-                seed=int(self.rng.integers(0, 2 ** 31 - 1)),
-            )
-        agent = ContextualBayesianBandit(beliefs, dim=self.context_dim + 1, alpha=1.0, sigma2=self.sigma2, pb_weight=self.pb_weight, seed=int(self.rng.integers(0, 2 ** 31 - 1)))
-        self.agent = agent
-        return agent
-
-    def load_agent(self, path: str):
-        with open(path, "rb") as fh:
-            self.agent = pickle.load(fh)
-        return self.agent
-
-    def save_agent(self, path: str):
-        if self.agent is None:
-            raise RuntimeError("No agent to save")
-        with open(path, "wb") as fh:
-            pickle.dump(self.agent, fh, protocol=pickle.HIGHEST_PROTOCOL)
-
-    # ---------------------
-    # Thompson propensity estimator
-    # ---------------------
-    def estimate_thompson_probas(self, context: np.ndarray, B: int = 500) -> Dict[str, float]:
-        """Monte Carlo estimate of p(a|x) under current Thompson agent."""
-        if self.agent is None:
-            raise RuntimeError("No agent loaded")
-        agent = self.agent
-        arms = agent.arms
-        K = len(arms)
-        x = np.asarray(context).reshape(-1)
-        dim_x = x.size
-        values = np.full((K, B), -np.inf, dtype=float)
-        rng_local = np.random.default_rng(int(self.rng.integers(0, 2 ** 31 - 1)))
-
-        for i, a in enumerate(arms):
-            # linear model posterior
-            try:
-                model = agent.models[a]
-                Lambda = np.atleast_2d(np.asarray(model.Lambda))
-                try:
-                    cov = np.linalg.inv(Lambda)
-                except Exception:
-                    cov = np.linalg.pinv(Lambda)
-                mean = _safe_posterior_mean_of_model(model, Lambda.shape[0])
+                true_rewards = np.array([1.0 + self.empirical_means[a].sum() for a in actions])
+                r_opt = max(1.0 + v.sum() for v in self.empirical_means.values())
             except Exception:
-                mean = np.zeros(dim_x, dtype=float)
-                cov = np.eye(dim_x, dtype=float) * 1e-6
+                # fallback: treat 0
+                true_rewards = np.zeros(len(actions), dtype=float)
+                r_opt = 0.0
+            regrets.append(float(np.mean(r_opt - true_rewards)))
+            _, counts = np.unique(actions, return_counts=True)
+            probs = counts / counts.sum()
+            entropies.append(float(-np.sum(probs * np.log(probs + 1e-12))))
 
-            # align shapes
-            if cov.shape[0] != dim_x or cov.shape[1] != dim_x:
-                if cov.shape[0] >= dim_x and cov.shape[1] >= dim_x:
-                    cov = cov[:dim_x, :dim_x]
-                else:
-                    newcov = np.eye(dim_x, dtype=float) * 1e-6
-                    newcov[: cov.shape[0], : cov.shape[1]] = cov
-                    cov = newcov
-                mean = _safe_align_vec(mean, dim_x)
-            else:
-                mean = _safe_align_vec(mean, dim_x)
-
-            # belief
-            try:
-                bel = agent.beliefs[a]
-                if getattr(bel, "has_new_obs", False) or getattr(bel, "t_post", None) != getattr(agent, "t", None):
-                    bel.compute_posterior(getattr(agent, "t", 0))
-                pb_mean = float(getattr(bel, "mean", 0.0))
-                pb_var = float(getattr(bel, "var", 0.0))
-                pb_std = float(np.sqrt(max(pb_var, 1e-12)))
-            except Exception:
-                pb_mean = 0.0
-                pb_std = 1e-6
-
-            # sample theta & pb
-            try:
-                thetas = rng_local.multivariate_normal(mean, cov, size=B)
-            except Exception:
-                thetas = np.tile(mean.reshape(1, -1), (B, 1))
-            preds = thetas @ x
-            pb_samples = pb_mean + pb_std * rng_local.standard_normal(size=B)
-            pw = float(getattr(agent, "pb_weight", self.pb_weight))
-            values[i, :] = preds + pw * pb_samples
-
-        chosen = np.argmax(values, axis=0)
-        counts = np.bincount(chosen, minlength=K)
-        probas = counts.astype(float) / float(B)
-        return {arms[i]: float(probas[i]) for i in range(K)}
+        # append logged_run to global log
+        self.logged.extend(logged_run)
+        return np.array(regrets), np.array(entropies), logged_run
 
     # ---------------------
-    # Greedy action (deterministic)
+    # Multi-trial simulate to compute mean/std regret curves
     # ---------------------
-    def greedy_action(self, context: np.ndarray, n_actions: int = 1) -> List[Any]:
-        if self.agent is None:
-            raise RuntimeError("No agent loaded")
-        x = np.asarray(context).reshape(-1)
-        arms = self.agent.arms
-        values = []
-        for a in arms:
-            try:
-                theta = _safe_posterior_mean_of_model(self.agent.models[a], x.size)
-            except Exception:
-                theta = np.zeros(x.size)
-            theta = _safe_align_vec(theta, x.size)
-            pred = float(theta @ x)
-            pb_mean = 0.0
-            try:
-                bel = self.agent.beliefs[a]
-                if getattr(bel, "has_new_obs", False) or getattr(bel, "t_post", None) != getattr(self.agent, "t", None):
-                    bel.compute_posterior(getattr(self.agent, "t", 0))
-                pb_mean = float(getattr(bel, "mean", 0.0))
-            except Exception:
-                pb_mean = 0.0
-            val = pred + float(getattr(self.agent, "pb_weight", self.pb_weight)) * pb_mean
-            values.append(val)
-        idxs = np.argsort(values)[::-1][:n_actions]
-        return [arms[i] for i in idxs]
-
-    # ---------------------
-    # Predict API (supports context dict or vector or pool id)
-    # ---------------------
-    def predict(self, context: Optional[List[float]] = None, context_id: Optional[int] = None, n_actions: int = 1, stochastic: bool = False) -> List[Any]:
-        if context_id is not None:
-            if context_id < 0 or context_id >= len(self.context_pool):
-                raise IndexError("context_id out of range")
-            ctx = self.context_pool[context_id]
-            x = context_to_vector(ctx)
-        elif context is not None:
-            x = np.asarray(context).reshape(-1)
-        else:
-            # sample a random one from pool
-            ctx = self.context_pool[self.rng.integers(0, len(self.context_pool))]
-            x = context_to_vector(ctx)
-        # ensure alignment
-        if x.size != self.context_dim + 1:
-            x = _safe_align_vec(x, self.context_dim + 1)
-        if stochastic:
-            if self.agent is None:
-                raise RuntimeError("No agent loaded")
-            return self.agent.act(x, n_actions=n_actions)
-        else:
-            return self.greedy_action(x, n_actions=n_actions)
-
-    # ---------------------
-    # Batch update / admin pushes traces
-    # ---------------------
-    def batch_update(self, updates: List[Dict], log: bool = True) -> int:
+    def simulate_trials(self, n_trials: int = 3, horizon: int = 180, n_actions: int = 3, propensity_mc: int = 500, selected_context_ids: Optional[List[int]] = None, context_mode: str = "random") -> Dict[str, Any]:
         """
-        updates: list of dicts with keys: 'a', 'trace' (list), optional 'context' (list or dict), optional 't', optional 'p_b', optional 'ctx_id'
+        Run multiple independent trials (fresh agent for each) and return aggregated regret statistics.
+        Returns dict with keys: 'regrets' (n_trials x horizon), 'mean_cum_regret' (horizon,), 'std_cum_regret' (horizon,)
         """
-        if self.agent is None:
-            raise RuntimeError("No agent loaded")
-        count = 0
-        for u in updates:
-            a = u["a"]
-            trace = np.atleast_2d(np.asarray(u["trace"], dtype=float))
-            ctx_raw = u.get("context", None)
-            ctx_id = u.get("ctx_id", None)
-            if ctx_raw is None and ctx_id is not None:
-                ctx_vec = context_to_vector(self.context_pool[int(ctx_id)])
-            elif ctx_raw is None:
-                ctx_vec = np.zeros(self.context_dim + 1, dtype=float)
-                ctx_vec[0] = 1.0
-            elif isinstance(ctx_raw, dict):
-                ctx_vec = context_to_vector(ctx_raw)
-            else:
-                ctx_vec = np.asarray(ctx_raw, dtype=float).reshape(-1)
-            t = int(u.get("t", getattr(self.agent, "t", 0)))
-            try:
-                self.agent.update(a, trace, ctx_vec)
-            except Exception:
-                # best-effort
-                try:
-                    self.agent.beliefs[a].update(trace, t)
-                    self.agent.models[a].update(ctx_vec, float(1.0 + trace.sum()))
-                except Exception:
-                    pass
-            p_b = float(u.get("p_b", 0.0))
-            entry = SimpleLoggedStep(x=ctx_vec.copy(), a=a, r=float(1.0 + trace.sum()), p_b=p_b, t=t, ctx_id=ctx_id)
-            if log:
-                self.logged.append(entry)
-            count += 1
-        return count
+        all_regrets = []
+        for i in range(n_trials):
+            # clear agent and use fresh agent to ensure independent trials
+            self.agent = None
+            reg, ent, logged_run = self.simulate_and_log(horizon=horizon, n_actions=n_actions, propensity_mc=propensity_mc, selected_context_ids=selected_context_ids, context_mode=context_mode, fresh_agent=True)
+            all_regrets.append(reg)
+        arr = np.vstack(all_regrets)  # (n_trials, horizon)
+        # compute cumulative average regret per trial, then mean/std across trials
+        xs = np.arange(1, arr.shape[1] + 1)
+        cumavg = np.cumsum(arr, axis=1) / xs
+        mean = np.mean(cumavg, axis=0)
+        std = np.std(cumavg, axis=0)
+        return {"regrets": arr, "cumavg_mean": mean, "cumavg_std": std}
 
     # ---------------------
-    # Simulation runner (single trial)
+    # OPE wrapper
     # ---------------------
-    def simulate_and_log(self, horizon: int = 180, n_actions: int = 3, propensity_mc: int = 500, selected_context_ids: Optional[List[int]] = None, context_mode: str = "random", fresh_agent: bool = True) -> Tuple[np.ndarray, np.ndarray, List[SimpleLoggedStep]]:
-        """
-        Run a single simulated trial using contexts sampled from selected_context_ids (or from full pool).
-        - fresh_agent: if True, re-create a fresh progressive agent from priors before the run.
-        Returns: (regrets_array, entropies_array, logged_entries_for_this_run)
-        """
-        if self.env is None:
-            raise RuntimeError("Environment not constructed - need eval pkl in place.")
-        if self.helper is None:
-            raise RuntimeError("No helper/priors available to instantiate progressive beliefs.")
+    def compute_ope(self, eval_agent=None, clip=10.0, snips=True, n_boot: int = 200):
+        if len(self.logged) == 0:
+            raise RuntimeError("No logged data available")
+        dataset = self.logged
+        arms = list(self.env.dists.keys()) if self.env is not None else list(self.agent.arms)
+        dm_model = DirectMethodModel(arms=arms, dim=self.context_dim + 1, alpha=1.0, sigma2=self.sigma2)
+        dm_model.fit(dataset)
+        if eval_agent is None:
+            eval_agent = self.agent
 
-        # optionally create fresh agent
-        if fresh_agent or self.agent is None:
-            self.create_fresh_agent(ProgressiveBelief)
+        def eval_action_fn(x):
+            x = np.asarray(x).reshape(-1)
+            # use greedy selection
+            return self.greedy_action(x, n_actions=1)[0]
 
-        agent = self.agent
-        arms = list(self.env.dists.keys())
-        logged_run: List[SimpleLoggedStep] = []
-        regrets = []
-        entropies = []
-        rng_local = np.random.default_rng(int(self.rng.integers(0, 2 ** 31 - 1)))
-
-        # prepare context sequence
-        if selected_context_ids is not None and len(selected_context_ids) > 0:
-            # validate ids
-            ids = [int(i) for i in selected_context_ids]
-            seq = []
-            if context_mode == "round-robin":
-                for i in range(horizon):
-                    seq.append(context_to_vector(self.context_pool[ids[i % len(ids)]]))
-            else:
-                for i in range(horizon):
-                    seq.append(context_to_vector(self.context_pool[ids[rng_local.integers(0, len(ids))]]))
-            ctx_seq = seq
-        else:
-            # sample from full pool
-            seq = []
-            if context_mode == "round-robin":
-                for i in range(horizon):
-                    seq.append(context_to_vector(self.context_pool[i % len(self.context_pool)]))
-            else:
-                for i in range(horizon):
-                    seq.append(context_to_vector(self.context_pool[rng_local.integers(0, len(self.context_pool))]))
-            ctx_seq = seq
-
-        for t in range(horizon):
-            x = np.asarray(ctx_seq[t]).reshape(-1)
-            # sample actions (this mutates agent state via sampling)
-            actions = agent.act(x, n_actions=n_actions)
-            # estimate propensities for logging
-            try:
-                probas = self.estimate_thompson_probas(x, B=propensity_mc)
-            except Exception:
-                probas = {a: 1.0 / len(arms) for a in arms}
-
-            # for each chosen action, sample trace from env, update and log
-            for a in actions:
-                p_b = max(probas.get(a, 0.0), 1e-12)
-                trace = self.env.step(a, t, n_samples=1, context=x)  # returns shape (1,w)
-                # ensure 2D
-                trace = np.atleast_2d(trace)
-                r = float(1.0 + trace.sum())
-                # log
-                entry = SimpleLoggedStep(x=x.copy(), a=a, r=r, p_b=p_b, t=t, ctx_id=None)
-                logged_run.append(entry)
-                # update agent
-                try:
-                    agent.update(a, trace, x)
-                except Exception:
-                    try:
-                        agent.beliefs[a].update(trace, t)
-                        agent.models[a].update(x, r)
-                    except Exception:
-                        pass
-            agent.step()
-
-            # compute regret diagnostic (use empirical_means)
-            try:
-                true_rewards = np.array([1.0 + self.empirical_means[a]
+        metrics = evaluate_offline(dataset=dataset, arms=arms, eval_action_fn=eval_action_fn, dm_model=dm_model, clip=clip, snips=snips, n_boot=n_boot)
+        return metrics
