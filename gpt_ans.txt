@@ -1,144 +1,241 @@
 """
-api.py - FastAPI endpoints for the ModelService with feature-pool and context-instance support.
+app.py - Streamlit Admin Console (feature-pool + context instances)
 
 Run:
-    uvicorn api:app --reload
+    streamlit run app.py
+
+This UI:
+ - shows canonical feature pool and allows admin to select which features to use
+ - allows admin to generate or add context instances (instances contain values for a subset of features)
+ - supports predicting (greedy or stochastic) for selected instances
+ - runs multi-trial simulation using selected instances and plots average cumulative-regret ± std
+ - computes OPE on the in-memory logged data
 """
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import List, Optional, Any, Dict
-import uvicorn
+import os
+import streamlit as st
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+import json
+from typing import List, Dict, Any
 
-from model_service import ModelService
+from model_service import ModelService, context_label, FEATURE_GENERATORS
 
-app = FastAPI(title="ContextualBanditModelAPI")
-svc = ModelService()
+st.set_page_config(layout="wide", page_title="Contextual Bandit Admin")
 
-# -------------------------
-# Request models
-# -------------------------
-class SelectFeaturesReq(BaseModel):
-    features: List[str]
+# init service
+if "svc" not in st.session_state:
+    st.session_state["svc"] = ModelService()
+svc: ModelService = st.session_state["svc"]
 
-class InstanceReq(BaseModel):
-    instance: Dict[str, Any]
+st.title("Contextual Bandit — Admin Console (Feature-Pool)")
 
-class MultipleInstancesReq(BaseModel):
-    instances: List[Dict[str, Any]]
+# layout
+left, right = st.columns([2, 3])
 
-class PredictInstanceReq(BaseModel):
-    instance_id: Optional[int] = None
-    instance: Optional[Dict[str, Any]] = None
-    n_actions: Optional[int] = 1
-    stochastic: Optional[bool] = False
+# -----------------------
+# Left panel: feature pool & contexts
+# -----------------------
+with left:
+    st.header("Feature pool")
+    fp = svc.get_feature_pool()
+    # display features with checkboxes
+    st.write("Select which features should be used by the model when building context vectors.")
+    feature_names = [f["name"] for f in fp]
+    # default selected are svc.selected_features
+    selected = st.multiselect("Select features (order is canonical; selected subset will be used)", feature_names, default=svc.get_selected_features())
+    if st.button("Apply selected features"):
+        try:
+            svc.set_selected_features(selected)
+            st.success(f"Selected features set: {svc.get_selected_features()}")
+            st.experimental_rerun()
+        except Exception as e:
+            st.error(f"Failed to set selected features: {e}")
 
-class SimulateReq(BaseModel):
-    instance_ids: Optional[List[int]] = None
-    horizon: Optional[int] = 60
-    n_actions: Optional[int] = 3
-    n_trials: Optional[int] = 3
-    context_mode: Optional[str] = "random"
-    propensity_mc: Optional[int] = 500
+    st.markdown("---")
+    st.header("Context instances (user examples)")
+    st.write("Instances are user feature dictionaries. They need only include values for selected features; missing features are filled with 0.")
 
-class UpdateEntry(BaseModel):
-    a: Any
-    trace: List[int]
-    context: Optional[Dict[str, Any]] = None
-    instance_id: Optional[int] = None
-    t: Optional[int] = None
-    p_b: Optional[float] = 0.0
+    # list existing instances
+    insts = svc.get_context_instances()
+    if len(insts) == 0:
+        st.info("No context instances yet. Generate some using the button below or add manually.")
+    else:
+        # show as table of selected features
+        show_cols = svc.get_selected_features()
+        table_rows = []
+        for i, inst in enumerate(insts):
+            row = {"id": i}
+            for f in show_cols:
+                row[f] = inst.get(f, None)
+            table_rows.append(row)
+        st.table(pd.DataFrame(table_rows).fillna(""))
 
-class UpdateBatchReq(BaseModel):
-    updates: List[UpdateEntry]
+    st.markdown("### Add / Generate instances")
+    with st.form("add_instance_form"):
+        st.write("Provide values for selected features (leave blank to use generator default).")
+        new_values = {}
+        for f in svc.get_selected_features():
+            gen = FEATURE_GENERATORS.get(f)
+            if gen is not None:
+                default = gen(svc.rng)
+            else:
+                default = 0.0
+            # choose input type
+            if isinstance(default, (int, np.integer)) and default in (0, 1):
+                val = st.selectbox(f"{f}", options=[0, 1], index=int(default == 1))
+            else:
+                val = st.number_input(f"{f}", value=float(default))
+            new_values[f] = val
+        add_inst = st.form_submit_button("Add instance")
+    if add_inst:
+        try:
+            idx = svc.add_context_instance(new_values)
+            st.success(f"Added instance id {idx}")
+            st.experimental_rerun()
+        except Exception as e:
+            st.error(f"Failed to add instance: {e}")
 
-# -------------------------
-# Endpoints
-# -------------------------
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+    if st.button("Generate random instances (5)"):
+        ids = svc.generate_random_instances(5)
+        st.success(f"Generated instances: {ids}")
+        st.experimental_rerun()
 
-@app.get("/features")
-def get_features():
-    try:
-        return {"features": svc.get_feature_pool(), "selected": svc.get_selected_features()}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/select_features")
-def set_selected_features(req: SelectFeaturesReq):
-    try:
-        svc.set_selected_features(req.features)
-        return {"selected": svc.get_selected_features()}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.get("/instances")
-def get_instances():
-    try:
-        return {"instances": svc.get_context_instances()}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/instances")
-def add_instance(req: InstanceReq):
-    try:
-        idx = svc.add_context_instance(req.instance)
-        return {"instance_id": idx}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.post("/generate_instances")
-def generate_instances(n: int = 5):
-    try:
-        ids = svc.generate_random_instances(n=n)
-        return {"added_ids": ids}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.post("/predict_instance")
-def predict_instance(req: PredictInstanceReq):
-    try:
-        if req.instance_id is not None:
-            actions = svc.predict(instance_id=req.instance_id, n_actions=req.n_actions, stochastic=req.stochastic)
-        elif req.instance is not None:
-            actions = svc.predict(instance=req.instance, n_actions=req.n_actions, stochastic=req.stochastic)
+    # optional: remove last
+    if st.button("Remove last instance"):
+        if len(svc.context_instances) > 0:
+            svc.remove_context_instance(len(svc.context_instances) - 1)
+            st.success("Removed last instance")
+            st.experimental_rerun()
         else:
-            actions = svc.predict(n_actions=req.n_actions, stochastic=req.stochastic)
-        return {"actions": actions}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+            st.info("No instances to remove.")
 
-@app.post("/simulate")
-def simulate(req: SimulateReq):
-    try:
-        res = svc.simulate_trials(n_trials=req.n_trials, horizon=req.horizon, n_actions=req.n_actions, propensity_mc=req.propensity_mc, selected_instance_ids=req.instance_ids, context_mode=req.context_mode)
-        return {
-            "cumavg_mean": res["cumavg_mean"].tolist(),
-            "cumavg_std": res["cumavg_std"].tolist(),
-            "regrets_shape": list(res["regrets"].shape),
-        }
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    st.markdown("---")
+    st.header("Agent management")
+    data_dir = "data"
+    if not os.path.exists(data_dir):
+        os.makedirs(data_dir, exist_ok=True)
 
-@app.post("/update_batch")
-def update_batch(req: UpdateBatchReq):
-    try:
-        updates = [u.dict() for u in req.updates]
-        n = svc.batch_update(updates, log=True)
-        return {"updated": n}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    saved_agents = [f for f in os.listdir(data_dir) if f.endswith(".pkl")]
+    saved_agents = sorted(saved_agents)
+    sel_agent = st.selectbox("Load agent (pickle)", ["-- none --"] + saved_agents)
+    if st.button("Load selected agent"):
+        if sel_agent == "-- none --":
+            st.warning("Choose an agent file first.")
+        else:
+            try:
+                svc.load_agent(os.path.join(data_dir, sel_agent))
+                st.success(f"Loaded agent {sel_agent}")
+            except Exception as e:
+                st.error(f"Failed to load: {e}")
 
-@app.get("/ope")
-def ope(n_boot: int = 200):
-    try:
-        metrics = svc.compute_ope(n_boot=n_boot)
-        return metrics
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    if st.button("Create fresh Progressive agent"):
+        try:
+            svc.create_fresh_agent()
+            st.success("Created fresh Progressive agent.")
+        except Exception as e:
+            st.error(f"Failed to create agent: {e}")
 
-# dev-run
-if __name__ == "__main__":
-    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)
+    if st.button("Save current agent to data/trained_agent_ui.pkl"):
+        try:
+            svc.save_agent(os.path.join(data_dir, "trained_agent_ui.pkl"))
+            st.success("Saved agent")
+        except Exception as e:
+            st.error(f"Failed to save agent: {e}")
+
+# -----------------------
+# Right panel: predict, simulate, OPE
+# -----------------------
+with right:
+    st.header("Prediction (selected instances)")
+    n_actions = st.number_input("n_actions (per instance)", min_value=1, max_value=20, value=3)
+    stochastic = st.checkbox("Stochastic (Thompson) sampling", value=False)
+
+    inst_options = [f"{i}: " + ", ".join(f"{k}={v}" for k, v in inst.items()) for i, inst in enumerate(svc.get_context_instances())]
+    selected_instances = st.multiselect("Select instances to predict for", inst_options, default=inst_options[:3] if len(inst_options) >= 3 else inst_options)
+
+    selected_instance_ids = []
+    for s in selected_instances:
+        try:
+            selected_instance_ids.append(int(s.split(":")[0]))
+        except Exception:
+            pass
+
+    if st.button("Predict for selected instances"):
+        if len(selected_instance_ids) == 0:
+            st.warning("Select at least one instance")
+        else:
+            rows = []
+            for iid in selected_instance_ids:
+                try:
+                    act = svc.predict(instance_id=iid, n_actions=n_actions, stochastic=stochastic)
+                    rows.append({"instance_id": iid, "actions": act})
+                except Exception as e:
+                    rows.append({"instance_id": iid, "actions": str(e)})
+            st.table(pd.DataFrame(rows))
+
+    st.markdown("---")
+    st.header("Simulation & Regret")
+    sim_horizon = st.number_input("horizon (rounds)", min_value=10, max_value=1000, value=60)
+    sim_trials = st.number_input("n_trials", min_value=1, max_value=50, value=3)
+    sim_mode = st.selectbox("context sampling mode", options=["random", "round-robin"], index=0)
+    # choose whether to use selected instances
+    use_selected_instances = st.checkbox("Use selected instances for simulation (if none selected, will sample from instance pool or generate from selected features)", value=True)
+
+    run_sim = st.button("Run simulation & show regret")
+    if run_sim:
+        try:
+            if use_selected_instances and len(selected_instance_ids) == 0:
+                st.warning("You selected to use instances but none are selected; using all instances in pool if available.")
+                selected_instance_ids = list(range(len(svc.context_instances)))
+            # run
+            with st.spinner("Running simulations..."):
+                res = svc.simulate_trials(n_trials=int(sim_trials), horizon=int(sim_horizon), n_actions=int(n_actions), propensity_mc=300, selected_instance_ids=(selected_instance_ids if len(selected_instance_ids) > 0 else None), context_mode=sim_mode)
+            mean_curve = np.asarray(res["cumavg_mean"])
+            std_curve = np.asarray(res["cumavg_std"])
+            xs = np.arange(1, mean_curve.size + 1)
+            fig, ax = plt.subplots(figsize=(10, 4))
+            ax.plot(xs, mean_curve, label="mean cumulative-average regret")
+            ax.fill_between(xs, mean_curve - std_curve, mean_curve + std_curve, alpha=0.12)
+            ax.set_xlabel("Round")
+            ax.set_ylabel("Average cumulative regret")
+            ax.set_title(f"Mean ± std over {sim_trials} trials")
+            ax.grid(alpha=0.3)
+            st.pyplot(fig)
+            st.success("Simulation complete (logs appended to in-memory buffer).")
+        except Exception as e:
+            st.error(f"Simulation failed: {e}")
+
+    st.markdown("---")
+    st.header("Offline Policy Evaluation (OPE)")
+    if st.button("Compute OPE (DR/IPS/DM)"):
+        if len(svc.logged) == 0:
+            st.warning("No logged data available. Run simulation first or add logs via /update_batch.")
+        else:
+            try:
+                with st.spinner("Computing OPE (bootstrap): this may take some time..."):
+                    metrics = svc.compute_ope(n_boot=200)
+                st.json(metrics)
+            except Exception as e:
+                st.error(f"OPE failed: {e}")
+
+    st.markdown("---")
+    st.header("Recent logged interactions (preview last 50)")
+    if len(svc.logged) == 0:
+        st.write("No logged interactions yet.")
+    else:
+        preview = []
+        for e in svc.logged[-50:]:
+            preview.append({"t": e.t, "a": e.a, "r": e.r, "p_b": e.p_b, "ctx_id": e.ctx_id})
+        st.table(pd.DataFrame(preview))
+
+st.markdown("---")
+st.write(
+    """
+Notes:
+ - "Selected features" controls which fields the admin will provide per-instance.
+ - Context vectors are built in a canonical order (defined in the service) and padded/truncated to match the model's expected dimension.
+ - Use "Generate random instances" to create sample user contexts for quick testing.
+"""
+)
