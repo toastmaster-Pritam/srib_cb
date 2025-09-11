@@ -1,215 +1,114 @@
-"""
-app.py - Streamlit Admin UI for your contextual bandit
-
-Usage:
-    streamlit run app.py
-
-Notes:
- - This UI uses the ModelService in-process (no separate HTTP required).
- - It expects model_service.py to be in the same folder and importable.
- - It reads/writes agent pickles in the ./data directory (create if missing).
-"""
-
 import os
-import streamlit as st
-import pandas as pd
-import matplotlib.pyplot as plt
+import pickle
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
-import json
 
-from model_service import ModelService, context_to_vector, context_label
-
-st.set_page_config(layout="wide", page_title="Contextual Bandit Admin")
-
-# initialize service in session_state
-if "svc" not in st.session_state:
-    st.session_state["svc"] = ModelService()
-svc: ModelService = st.session_state["svc"]
-
-st.title("Contextual Bandit — Admin Console")
-
-# Layout: left control column, right main column
-left_col, right_col = st.columns([2, 3])
-
-with left_col:
-    st.header("Context pool")
-    pool = svc.get_context_pool()
-    if len(pool) == 0:
-        st.info("Context pool is empty. Default contexts will be created automatically.")
-    # Build options for display: "id: label"
-    options = [f"{c['id']}: {c['label']}" for c in pool]
-    # Default select first 3 if available
-    default_sel = options[:3] if len(options) >= 3 else options
-    selected = st.multiselect("Select contexts (one or more)", options, default=default_sel)
-
-    # Parse selected ids robustly
-    selected_ids = []
-    for s in selected:
-        try:
-            idx = int(s.split(":")[0].strip())
-            if 0 <= idx < len(svc.context_pool):
-                selected_ids.append(idx)
-        except Exception:
-            # ignore parse errors
-            pass
-
-    st.markdown("### Add new context")
-    with st.form("ctx_form"):
-        age = st.slider("age", 0.0, 1.0, 0.5)
-        device_mobile = st.selectbox("device_mobile", options=[0, 1], index=1)
-        premium = st.selectbox("premium", options=[0, 1], index=0)
-        recent_eng = st.slider("recent_eng", 0.0, 1.0, 0.2)
-        add_ctx = st.form_submit_button("Add context to pool")
-    if add_ctx:
-        ctx = {"age": float(age), "device_mobile": int(device_mobile), "recent_eng": float(recent_eng), "premium": int(premium)}
-        try:
-            new_id = svc.add_context_to_pool(ctx)
-            st.success(f"Added context id={new_id} — {context_label(ctx)}")
-            st.experimental_rerun()
-        except Exception as e:
-            st.error(f"Failed to add context: {e}")
-
-    st.markdown("---")
-    st.header("Agent management")
-
-    # Ensure data directory exists
-    data_dir = "data"
-    if not os.path.exists(data_dir):
-        os.makedirs(data_dir, exist_ok=True)
-
-    # List saved agents
+# Try to import your original experiment classes (tolerant)
+try:
+    from impatient_bandits import (
+        ContextualBayesianBandit,
+        ProgressiveBelief,
+        EmpiricalDistribution,
+        Environment,
+        StickinessHelper,
+    )
     try:
-        saved_agents = [f for f in os.listdir(data_dir) if f.endswith(".pkl")]
-        saved_agents = sorted(saved_agents)
+        from impatient_bandits import DirectMethodModel, evaluate_offline, LoggedStep  # type: ignore
     except Exception:
-        saved_agents = []
+        from impatient_contextual.ope import DirectMethodModel, evaluate_offline, LoggedStep  # type: ignore
+except Exception:
+    # fallback to module-style imports used earlier
+    try:
+        from impatient_contextual.contextual_bandit import ContextualBayesianBandit  # type: ignore
+        from impatient_contextual.belief import ProgressiveBelief  # type: ignore
+        from impatient_contextual.data import EmpiricalDistribution  # type: ignore
+        from impatient_contextual.env import Environment  # type: ignore
+        from impatient_contextual.helper import StickinessHelper  # type: ignore
+        from impatient_contextual.ope import DirectMethodModel, evaluate_offline, LoggedStep  # type: ignore
+    except Exception as e:
+        raise ImportError(f"Could not import experiment modules: {e}")
 
-    sel_agent = st.selectbox("Choose agent file to load (pickle)", ["-- none --"] + saved_agents)
-    if st.button("Load selected agent"):
-        if sel_agent == "-- none --":
-            st.warning("Choose an agent file first.")
-        else:
-            path = os.path.join(data_dir, sel_agent)
-            try:
-                svc.load_agent(path)
-                st.success(f"Loaded agent from {path}")
-            except Exception as e:
-                st.error(f"Failed to load agent: {e}")
+# --- Logged step --- compatible shape
+@dataclass
+class SimpleLoggedStep:
+    x: np.ndarray
+    a: Any
+    r: float
+    p_b: float
+    t: int
+    ctx_id: Optional[int] = None
 
-    if st.button("Create fresh Progressive agent"):
-        try:
-            svc.create_fresh_agent()
-            st.success("Created fresh Progressive agent (from priors).")
-        except Exception as e:
-            st.error(f"Could not create fresh agent: {e}\nHint: ensure 'data/synthetic-data-train.pkl' and 'data/synthetic-data-eval.pkl' exist and are correct.")
+    # evaluate_offline expects attributes; keep this simple
+    def to_tuple(self):
+        return (self.x, self.a, self.r, self.p_b, self.t)
 
-    if st.button("Save current agent to data/trained_agent_ui.pkl"):
-        try:
-            svc.save_agent(os.path.join(data_dir, "trained_agent_ui.pkl"))
-            st.success("Saved agent to data/trained_agent_ui.pkl")
-        except Exception as e:
-            st.error(f"Failed to save agent: {e}")
+# -------------------------
+# Canonical feature pool
+# -------------------------
+# Order matters: this canonical ordering is used to build full vectors.
+# IMPORTANT: original experiments used [age, device_mobile, recent_eng, premium]
+CANONICAL_FEATURES = [
+    "age",             # float in [0,1]
+    "device_mobile",   # binary 0/1
+    "recent_eng",      # float in [0,1]
+    "premium",         # binary 0/1
+    # additional optional features
+    "time_of_day",     # float [0,1] (normalized)
+    "watch_time",      # float [0,1]
+    "session_length",  # float [0,1]
+    "is_weekend",      # binary 0/1
+    "location_norm",   # float [0,1] representing location id normalized
+    "hour_of_day",     # float [0,1]
+]
 
-    if st.button("Clear logged data"):
-        svc.logged = []
-        st.success("Cleared logged interactions.")
+# generator functions for sampling default values for each feature
+def _gen_age(rng): return float(rng.uniform(0, 1))
+def _gen_mobile(rng): return int(rng.binomial(1, 0.6))
+def _gen_recent_eng(rng): return float(np.tanh(rng.exponential(1.0) / 2.0))
+def _gen_premium(rng): return int(rng.binomial(1, 0.2))
+def _gen_time_of_day(rng): return float(rng.uniform(0, 1))
+def _gen_watch_time(rng): return float(np.clip(rng.exponential(0.2), 0.0, 1.0))
+def _gen_session_length(rng): return float(np.clip(rng.exponential(0.5), 0.0, 1.0))
+def _gen_is_weekend(rng): return int(rng.binomial(1, 0.28))
+def _gen_location_norm(rng): return float(rng.integers(0, 100) / 99.0)
+def _gen_hour_of_day(rng): return float(rng.integers(0, 23) / 23.0)
 
-with right_col:
-    st.header("Prediction")
-    n_actions = st.number_input("n_actions (per context)", min_value=1, max_value=20, value=3)
-    stochastic = st.checkbox("Stochastic (Thompson sampling)", value=False)
+FEATURE_GENERATORS = {
+    "age": _gen_age,
+    "device_mobile": _gen_mobile,
+    "recent_eng": _gen_recent_eng,
+    "premium": _gen_premium,
+    "time_of_day": _gen_time_of_day,
+    "watch_time": _gen_watch_time,
+    "session_length": _gen_session_length,
+    "is_weekend": _gen_is_weekend,
+    "location_norm": _gen_location_norm,
+    "hour_of_day": _gen_hour_of_day,
+}
 
-    if st.button("Predict for selected contexts"):
-        if len(selected_ids) == 0:
-            st.warning("Select at least one context from the left panel.")
-        else:
-            rows = []
-            for idx in selected_ids:
-                try:
-                    ctx = svc.context_pool[idx]
-                    vec = context_to_vector(ctx)
-                    # padding/truncation safety
-                    if vec.size != svc.context_dim + 1:
-                        vec = np.asarray(vec).reshape(-1)
-                        vec = np.pad(vec, (0, max(0, svc.context_dim + 1 - vec.size)))
-                    acts = svc.predict(context_id=idx, n_actions=n_actions, stochastic=stochastic)
-                    rows.append({"context_id": idx, "label": context_label(ctx), "actions": acts})
-                except Exception as e:
-                    rows.append({"context_id": idx, "label": "ERROR", "actions": str(e)})
-            st.table(pd.DataFrame(rows))
+# simple human label
+def feature_label(name: str) -> str:
+    return name.replace("_", " ").title()
 
-    st.markdown("---")
-    st.header("Simulation & Regret analysis")
-    sim_horizon = st.number_input("horizon (rounds)", min_value=10, max_value=1000, value=60)
-    sim_trials = st.number_input("n_trials", min_value=1, max_value=20, value=3)
-    sim_mode = st.selectbox("context sampling mode", options=["random", "round-robin"], index=0)
+# -------------------------
+# Vector / posterior helpers
+# -------------------------
+def _safe_align_vec(vec: np.ndarray, target_len: int) -> np.ndarray:
+    v = np.asarray(vec).reshape(-1)
+    if v.size == target_len:
+        return v.astype(float)
+    if v.size < target_len:
+        out = np.zeros(target_len, dtype=float)
+        out[: v.size] = v
+        return out
+    return v[:target_len].astype(float)
 
-    run_sim = st.button("Run simulation & plot regret")
-    if run_sim:
-        if len(selected_ids) == 0:
-            st.warning("Select contexts to simulate with (or add contexts to the pool).")
-        else:
-            with st.spinner("Running simulations (this may take a little while)..."):
-                try:
-                    res = svc.simulate_trials(
-                        n_trials=int(sim_trials),
-                        horizon=int(sim_horizon),
-                        n_actions=int(n_actions),
-                        propensity_mc=300,
-                        selected_context_ids=selected_ids,
-                        context_mode=sim_mode,
-                    )
-                    mean_curve = np.asarray(res["cumavg_mean"])
-                    std_curve = np.asarray(res["cumavg_std"])
-                    xs = np.arange(1, mean_curve.size + 1)
-
-                    fig, ax = plt.subplots(figsize=(10, 4))
-                    ax.plot(xs, mean_curve, label="mean cumulative-average regret")
-                    ax.fill_between(xs, mean_curve - std_curve, mean_curve + std_curve, alpha=0.12)
-                    ax.set_xlabel("Round")
-                    ax.set_ylabel("Average cumulative regret")
-                    ax.set_title(f"Mean ± std over {sim_trials} trials")
-                    ax.grid(alpha=0.3)
-                    ax.legend()
-                    st.pyplot(fig)
-                    st.success("Simulation finished. Logged interactions appended to service buffer.")
-                except Exception as e:
-                    st.error(f"Simulation error: {e}")
-
-    st.markdown("---")
-    st.header("Offline Policy Evaluation (OPE)")
-    if st.button("Compute OPE (DR/IPS/DM) on current logged data"):
-        if len(svc.logged) == 0:
-            st.warning("No logged data available. Run simulation or upload logs first.")
-        else:
-            with st.spinner("Computing OPE (bootstrap; may take time)..."):
-                try:
-                    metrics = svc.compute_ope(n_boot=200)
-                    st.json(metrics)
-                except Exception as e:
-                    st.error(f"OPE failed: {e}")
-
-    st.markdown("---")
-    st.header("Recent logged interactions (most recent 50)")
-    if len(svc.logged) == 0:
-        st.info("No logged interactions yet. Run simulation to produce logs.")
-    else:
-        rows = []
-        for e in svc.logged[-50:]:
-            # e.x may be numpy array; convert small preview
-            try:
-                x_preview = np.round(np.asarray(e.x).astype(float)[:5], 3).tolist()
-            except Exception:
-                x_preview = str(e.x)
-            rows.append({"a": e.a, "r": e.r, "p_b": e.p_b, "t": e.t, "ctx_id": e.ctx_id, "x": x_preview})
-        st.table(pd.DataFrame(rows))
-
-st.markdown("---")
-st.write(
-    """
-Notes:
-- The context pool populates the dropdown on the left. Select several contexts, then "Predict" or "Run simulation".
-- Simulations create logged interactions in memory (svc.logged). Use 'Compute OPE' to evaluate the latest logs.
-- If creating a fresh Progressive agent fails, make sure `data/synthetic-data-train.pkl` and `data/synthetic-data-eval.pkl` are present and valid.
-"""
-)
+def _safe_posterior_mean_of_model(model, target_len: int) -> np.ndarray:
+    try:
+        pm = model.posterior_mean()
+        arr = np.asarray(pm).reshape(-1)
+    except Exception:
+        return np.zeros(target_len, dtype=float)
+    return _safe_align_vec(arr, target_len)
