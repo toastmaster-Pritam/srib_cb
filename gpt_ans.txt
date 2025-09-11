@@ -1,73 +1,126 @@
-# api.py
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import List, Any, Optional
-import uvicorn
+# app.py
+import streamlit as st
+import json
+import os
+import pickle
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
 
 from model_service import ModelService
 
-app = FastAPI(title="ContextualBanditModelAPI")
+st.set_page_config(layout="wide", page_title="Contextual Bandit Admin")
 
-# single global service instance (simple deployment)
-svc = ModelService()  # will attempt to load eval pkl from data/ if present
+# Initialize or reuse service
+if "svc" not in st.session_state:
+    st.session_state["svc"] = ModelService()
+svc: ModelService = st.session_state["svc"]
 
-# Pydantic request/response models
-class PredictRequest(BaseModel):
-    context: List[float]
-    n_actions: Optional[int] = 3
-    stochastic: Optional[bool] = False
+st.title("Contextual Bandit — Admin Console")
+col1, col2 = st.columns([2, 3])
 
-class PredictResponse(BaseModel):
-    actions: List[Any]
+with col1:
+    st.header("Agent Management")
+    st.write("Load or create an agent (won't overwrite your `main.py`).")
 
-class UpdateEntry(BaseModel):
-    a: Any
-    trace: List[int]
-    context: Optional[List[float]] = None
-    t: Optional[int] = None
-    p_b: Optional[float] = 0.0
+    # list saved agents in data/
+    saved_agents = [f for f in os.listdir("data") if f.endswith(".pkl")]
+    saved_agents = sorted(saved_agents)
+    sel_file = st.selectbox("Select agent file (pickle)", ["-- none --"] + saved_agents)
 
-class UpdateBatchRequest(BaseModel):
-    updates: List[UpdateEntry]
+    if st.button("Load selected agent") and sel_file != "-- none --":
+        path = os.path.join("data", sel_file)
+        try:
+            svc.load_agent(path)
+            st.success(f"Loaded agent from {path}")
+        except Exception as e:
+            st.error(f"Failed to load agent: {e}")
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+    if st.button("Create fresh Progressive agent (using priors)"):
+        try:
+            svc.create_fresh_agent()
+            st.success("Created fresh agent with ProgressiveBelief priors.")
+        except Exception as e:
+            st.error(f"Could not create agent: {e}")
 
-@app.post("/predict", response_model=PredictResponse)
-def predict(req: PredictRequest):
+    if st.button("Save current agent to data/trained_agent_ui.pkl"):
+        try:
+            svc.save_agent("data/trained_agent_ui.pkl")
+            st.success("Saved agent.")
+        except Exception as e:
+            st.error(str(e))
+
+    st.markdown("---")
+    st.header("Env / Simulation")
+    st.write("If you have `data/synthetic-data-eval.pkl` in the repo, the simulator will be available.")
+    if svc.env is not None:
+        st.success("Simulator available (eval pkl loaded).")
+        st.write(f"Items in env: {len(svc.env.dists)}")
+    else:
+        st.warning("No simulator found — place `data/synthetic-data-eval.pkl` to enable simulation.")
+
+with col2:
+    st.header("Prediction / Update")
+    st.write("Create a context and request recommendations.")
+    with st.form("predict_form"):
+        n_actions = st.number_input("n_actions", min_value=1, max_value=20, value=3)
+        ctx_json = st.text_area("Context JSON (list) — include intercept as first element", value='[1.0, 0.5, 1, 0.2, 0]')
+        use_stochastic = st.checkbox("Stochastic (Thompson) prediction", value=False)
+        predict_submit = st.form_submit_button("Predict")
+
+    if predict_submit:
+        try:
+            ctx = np.array(json.loads(ctx_json))
+            actions = svc.predict(ctx.tolist(), n_actions=n_actions, stochastic=use_stochastic)
+            st.write("Recommended arms:", actions)
+        except Exception as e:
+            st.error(f"Prediction failed: {e}")
+
+    st.markdown("---")
+    st.write("Batch update: upload JSON array of updates, each {a, trace, context, t(optional)}")
+    uploaded = st.file_uploader("Upload updates (.json)", type=["json"])
+    if uploaded is not None:
+        try:
+            updates = json.load(uploaded)
+            n = svc.batch_update(updates, log=True)
+            st.success(f"Applied {n} updates and appended to local log.")
+        except Exception as e:
+            st.error(f"Failed to apply updates: {e}")
+
+st.markdown("---")
+st.header("Analytics")
+
+if st.button("Run simulate & log (short, horizon=60)"):
     try:
-        actions = svc.predict(req.context, n_actions=req.n_actions, stochastic=req.stochastic)
-        return {"actions": actions}
+        svc.logged = []  # reset log
+        regrets, ent = svc.simulate_and_log(horizon=60, n_actions=3, propensity_mc=300)
+        st.line_chart(pd.DataFrame({"regret": regrets}).cumsum() / (np.arange(1, len(regrets) + 1)))
+        st.success("Simulation done and logged.")
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        st.error(str(e))
 
-@app.post("/update_batch")
-def update_batch(req: UpdateBatchRequest):
+if st.button("Compute OPE (DR, IPS, DM) on current log"):
     try:
-        updates = [u.dict() for u in req.updates]
-        n = svc.batch_update(updates, log=True)
-        return {"updated": n}
+        metrics = svc.compute_ope(n_boot=200)
+        st.json(metrics)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        st.error(str(e))
 
+if len(svc.logged) > 0:
+    st.write("Logged interactions (last 20):")
+    rows = []
+    for entry in svc.logged[-20:]:
+        rows.append({"a": entry.a, "r": entry.r, "p_b": entry.p_b, "t": entry.t})
+    st.table(pd.DataFrame(rows))
 
-@app.post("/simulate")
-def simulate(horizon: int = 180, n_actions: int = 3, propensity_mc: int = 500):
-    try:
-        regrets, entropies = svc.simulate_and_log(horizon=horizon, n_actions=n_actions, propensity_mc=propensity_mc)
-        return {"horizon": int(horizon), "mean_regret": float(regrets.mean()), "regrets": list(map(float, regrets))}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.get("/ope")
-def ope(n_boot: int = 200):
-    try:
-        metrics = svc.compute_ope(n_boot=n_boot)
-        return metrics
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-# Optional: run with `python api.py` (for quick dev)
-if __name__ == "__main__":
-    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)
+st.markdown("### Notes")
+st.write(
+    """
+- To run this app in production mode with an API, start the FastAPI service:
+  `uvicorn api:app --reload --host 0.0.0.0 --port 8000`
+  Then the UI can call `/predict` and `/update_batch` if you modify the code to call HTTP endpoints.
+- This Streamlit app uses the ModelService in-process (no network calls).
+- The regret curves and OPE are meaningful only when the environment (eval pkl) exists and you simulate / log interactions.
+- We intentionally **do not** overwrite your `main.py`.
+"""
+)
