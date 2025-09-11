@@ -1,56 +1,59 @@
 """
-app.py - Streamlit Admin UI
+app.py - Streamlit Admin UI for your contextual bandit
 
-Run:
+Usage:
     streamlit run app.py
 
-This UI uses ModelService in-process (no separate API by default).
-Features:
- - context pool selection & editing (simple)
- - predict (greedy / stochastic) for selected contexts
- - simulate with selected contexts, plot regret curve (mean ± std over trials)
- - compute OPE on the logged dataset
+Notes:
+ - This UI uses the ModelService in-process (no separate HTTP required).
+ - It expects model_service.py to be in the same folder and importable.
+ - It reads/writes agent pickles in the ./data directory (create if missing).
 """
 
+import os
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 import json
-from typing import List
 
 from model_service import ModelService, context_to_vector, context_label
 
 st.set_page_config(layout="wide", page_title="Contextual Bandit Admin")
 
-# ensure session service
+# initialize service in session_state
 if "svc" not in st.session_state:
     st.session_state["svc"] = ModelService()
-
 svc: ModelService = st.session_state["svc"]
 
 st.title("Contextual Bandit — Admin Console")
 
-left, right = st.columns([2, 3])
+# Layout: left control column, right main column
+left_col, right_col = st.columns([2, 3])
 
-with left:
+with left_col:
     st.header("Context pool")
     pool = svc.get_context_pool()
-    df_pool = pd.DataFrame(pool)
-    # show as selectable list (multi-select uses labels)
-    options = [f"{row['id']}: {row['label']}" for _, row in df_pool.iterrows()]
-    selected = st.multiselect("Select contexts (one or more)", options, default=options[:3])
+    if len(pool) == 0:
+        st.info("Context pool is empty. Default contexts will be created automatically.")
+    # Build options for display: "id: label"
+    options = [f"{c['id']}: {c['label']}" for c in pool]
+    # Default select first 3 if available
+    default_sel = options[:3] if len(options) >= 3 else options
+    selected = st.multiselect("Select contexts (one or more)", options, default=default_sel)
 
-    # parse selected ids
+    # Parse selected ids robustly
     selected_ids = []
     for s in selected:
         try:
-            idx = int(s.split(":")[0])
-            selected_ids.append(idx)
+            idx = int(s.split(":")[0].strip())
+            if 0 <= idx < len(svc.context_pool):
+                selected_ids.append(idx)
         except Exception:
+            # ignore parse errors
             pass
 
-    st.markdown("**Edit / Add context**")
+    st.markdown("### Add new context")
     with st.form("ctx_form"):
         age = st.slider("age", 0.0, 1.0, 0.5)
         device_mobile = st.selectbox("device_mobile", options=[0, 1], index=1)
@@ -59,104 +62,154 @@ with left:
         add_ctx = st.form_submit_button("Add context to pool")
     if add_ctx:
         ctx = {"age": float(age), "device_mobile": int(device_mobile), "recent_eng": float(recent_eng), "premium": int(premium)}
-        new_id = svc.add_context_to_pool(ctx)
-        st.success(f"Added context id={new_id}")
-        st.experimental_rerun()
-
-    st.markdown("---")
-    st.header("Agent")
-    saved_agents = [f for f in st.sidebar.empty() or []]  # placeholder to avoid linter
-    # list pickles in data/
-    import os
-    saved_agents = [f for f in os.listdir("data") if f.endswith(".pkl")]
-    sel_agent = st.selectbox("Load agent (pickle)", ["-- none --"] + saved_agents)
-    if st.button("Load selected agent") and sel_agent != "-- none --":
         try:
-            svc.load_agent(os.path.join("data", sel_agent))
+            new_id = svc.add_context_to_pool(ctx)
+            st.success(f"Added context id={new_id} — {context_label(ctx)}")
             st.experimental_rerun()
         except Exception as e:
-            st.error(f"Failed to load agent: {e}")
+            st.error(f"Failed to add context: {e}")
+
+    st.markdown("---")
+    st.header("Agent management")
+
+    # Ensure data directory exists
+    data_dir = "data"
+    if not os.path.exists(data_dir):
+        os.makedirs(data_dir, exist_ok=True)
+
+    # List saved agents
+    try:
+        saved_agents = [f for f in os.listdir(data_dir) if f.endswith(".pkl")]
+        saved_agents = sorted(saved_agents)
+    except Exception:
+        saved_agents = []
+
+    sel_agent = st.selectbox("Choose agent file to load (pickle)", ["-- none --"] + saved_agents)
+    if st.button("Load selected agent"):
+        if sel_agent == "-- none --":
+            st.warning("Choose an agent file first.")
+        else:
+            path = os.path.join(data_dir, sel_agent)
+            try:
+                svc.load_agent(path)
+                st.success(f"Loaded agent from {path}")
+            except Exception as e:
+                st.error(f"Failed to load agent: {e}")
 
     if st.button("Create fresh Progressive agent"):
         try:
             svc.create_fresh_agent()
-            st.success("Created fresh Progressive agent.")
+            st.success("Created fresh Progressive agent (from priors).")
         except Exception as e:
-            st.error(str(e))
+            st.error(f"Could not create fresh agent: {e}\nHint: ensure 'data/synthetic-data-train.pkl' and 'data/synthetic-data-eval.pkl' exist and are correct.")
+
+    if st.button("Save current agent to data/trained_agent_ui.pkl"):
+        try:
+            svc.save_agent(os.path.join(data_dir, "trained_agent_ui.pkl"))
+            st.success("Saved agent to data/trained_agent_ui.pkl")
+        except Exception as e:
+            st.error(f"Failed to save agent: {e}")
 
     if st.button("Clear logged data"):
         svc.logged = []
-        st.success("Cleared logged data")
+        st.success("Cleared logged interactions.")
 
-with right:
-    st.header("Predict")
+with right_col:
+    st.header("Prediction")
     n_actions = st.number_input("n_actions (per context)", min_value=1, max_value=20, value=3)
-    stochastic = st.checkbox("Stochastic (Thompson)", value=False)
+    stochastic = st.checkbox("Stochastic (Thompson sampling)", value=False)
 
     if st.button("Predict for selected contexts"):
         if len(selected_ids) == 0:
-            st.warning("Select at least one context")
+            st.warning("Select at least one context from the left panel.")
         else:
             rows = []
             for idx in selected_ids:
                 try:
                     ctx = svc.context_pool[idx]
                     vec = context_to_vector(ctx)
-                    try:
-                        acts = svc.predict(context_id=idx, n_actions=n_actions, stochastic=stochastic)
-                    except Exception as e:
-                        acts = f"err: {e}"
+                    # padding/truncation safety
+                    if vec.size != svc.context_dim + 1:
+                        vec = np.asarray(vec).reshape(-1)
+                        vec = np.pad(vec, (0, max(0, svc.context_dim + 1 - vec.size)))
+                    acts = svc.predict(context_id=idx, n_actions=n_actions, stochastic=stochastic)
                     rows.append({"context_id": idx, "label": context_label(ctx), "actions": acts})
                 except Exception as e:
                     rows.append({"context_id": idx, "label": "ERROR", "actions": str(e)})
             st.table(pd.DataFrame(rows))
 
     st.markdown("---")
-    st.header("Simulation & Regret")
+    st.header("Simulation & Regret analysis")
     sim_horizon = st.number_input("horizon (rounds)", min_value=10, max_value=1000, value=60)
     sim_trials = st.number_input("n_trials", min_value=1, max_value=20, value=3)
-    sim_mode = st.selectbox("context sampling", options=["random", "round-robin"], index=0)
-    run_sim = st.button("Run simulation & plot regret")
+    sim_mode = st.selectbox("context sampling mode", options=["random", "round-robin"], index=0)
 
+    run_sim = st.button("Run simulation & plot regret")
     if run_sim:
         if len(selected_ids) == 0:
-            st.warning("Select contexts to simulate with (or add some).")
+            st.warning("Select contexts to simulate with (or add contexts to the pool).")
         else:
-            with st.spinner("Running simulations..."):
-                res = svc.simulate_trials(n_trials=int(sim_trials), horizon=int(sim_horizon), n_actions=int(n_actions), propensity_mc=300, selected_context_ids=selected_ids, context_mode=sim_mode)
-            mean_curve = res["cumavg_mean"]
-            std_curve = res["cumavg_std"]
-            xs = np.arange(1, len(mean_curve) + 1)
-            fig, ax = plt.subplots(figsize=(9, 4))
-            ax.plot(xs, mean_curve, label="mean cum. avg. regret")
-            ax.fill_between(xs, mean_curve - std_curve, mean_curve + std_curve, alpha=0.12)
-            ax.set_xlabel("Round")
-            ax.set_ylabel("Average cumulative regret")
-            ax.legend()
-            ax.grid(alpha=0.3)
-            st.pyplot(fig)
-            st.success("Simulation complete; logged interactions appended to service logged buffer.")
+            with st.spinner("Running simulations (this may take a little while)..."):
+                try:
+                    res = svc.simulate_trials(
+                        n_trials=int(sim_trials),
+                        horizon=int(sim_horizon),
+                        n_actions=int(n_actions),
+                        propensity_mc=300,
+                        selected_context_ids=selected_ids,
+                        context_mode=sim_mode,
+                    )
+                    mean_curve = np.asarray(res["cumavg_mean"])
+                    std_curve = np.asarray(res["cumavg_std"])
+                    xs = np.arange(1, mean_curve.size + 1)
+
+                    fig, ax = plt.subplots(figsize=(10, 4))
+                    ax.plot(xs, mean_curve, label="mean cumulative-average regret")
+                    ax.fill_between(xs, mean_curve - std_curve, mean_curve + std_curve, alpha=0.12)
+                    ax.set_xlabel("Round")
+                    ax.set_ylabel("Average cumulative regret")
+                    ax.set_title(f"Mean ± std over {sim_trials} trials")
+                    ax.grid(alpha=0.3)
+                    ax.legend()
+                    st.pyplot(fig)
+                    st.success("Simulation finished. Logged interactions appended to service buffer.")
+                except Exception as e:
+                    st.error(f"Simulation error: {e}")
 
     st.markdown("---")
-    st.header("OPE on logged data")
-    if st.button("Compute OPE (DR/IPS/DM)"):
+    st.header("Offline Policy Evaluation (OPE)")
+    if st.button("Compute OPE (DR/IPS/DM) on current logged data"):
         if len(svc.logged) == 0:
-            st.warning("No logged data available. Run simulation first or upload logs.")
+            st.warning("No logged data available. Run simulation or upload logs first.")
         else:
-            with st.spinner("Computing OPE (bootstrap)..."):
+            with st.spinner("Computing OPE (bootstrap; may take time)..."):
                 try:
                     metrics = svc.compute_ope(n_boot=200)
                     st.json(metrics)
                 except Exception as e:
-                    st.error(str(e))
+                    st.error(f"OPE failed: {e}")
 
     st.markdown("---")
-    st.header("Recent logged interactions")
-    if len(svc.logged) > 0:
+    st.header("Recent logged interactions (most recent 50)")
+    if len(svc.logged) == 0:
+        st.info("No logged interactions yet. Run simulation to produce logs.")
+    else:
         rows = []
         for e in svc.logged[-50:]:
-            rows.append({"a": e.a, "r": e.r, "p_b": e.p_b, "t": e.t, "ctx_id": e.ctx_id})
+            # e.x may be numpy array; convert small preview
+            try:
+                x_preview = np.round(np.asarray(e.x).astype(float)[:5], 3).tolist()
+            except Exception:
+                x_preview = str(e.x)
+            rows.append({"a": e.a, "r": e.r, "p_b": e.p_b, "t": e.t, "ctx_id": e.ctx_id, "x": x_preview})
         st.table(pd.DataFrame(rows))
 
 st.markdown("---")
-st.write("Notes: Use the left panel to manage contexts and the agent. Use the right panel for prediction, simulation and OPE.")
+st.write(
+    """
+Notes:
+- The context pool populates the dropdown on the left. Select several contexts, then "Predict" or "Run simulation".
+- Simulations create logged interactions in memory (svc.logged). Use 'Compute OPE' to evaluate the latest logs.
+- If creating a fresh Progressive agent fails, make sure `data/synthetic-data-train.pkl` and `data/synthetic-data-eval.pkl` are present and valid.
+"""
+)
