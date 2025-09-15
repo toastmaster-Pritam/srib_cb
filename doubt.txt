@@ -1,78 +1,364 @@
-import os
+"""
+run_obd_pipeline.py
+
+Full pipeline:
+ - load Open Bandit Dataset (OBD) via obp
+ - build per-item empirical traces (Spotify-like format)
+ - estimate priors via your StickinessHelper
+ - build EmpiricalDistribution environment from traces
+ - run Thompson-style contextual bandits:
+     * ProgressiveBelief + BayesianLinearModel (our agent)
+     * Baseline: context-only BayesianLinearModel (pb_weight=0)  --> "Lin-TS-like"
+     * Dummy (random)
+ - log agent behavior (propensities estimated via MC of Thompson draws)
+ - run OPE (IPS, SNIPS, DM, DR) on the logged dataset
+ - compare metrics and plot regret
+IMPORTANT: This script assumes your impatient_bandits package (the code you shared) is importable.
+"""
+import math
 import pickle
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
 
 import numpy as np
+import pandas as pd
+from tqdm.auto import tqdm
+import matplotlib.pyplot as plt
 
-# Try importing experiment modules (tolerant)
 
+import pandas as pd
+
+# ---- Monkey patch for OBP compatibility with pandas >= 2.0 ----
+if pd.__version__.startswith(("2", "3")):
+    # Patch DataFrame.drop
+    old_drop = pd.DataFrame.drop
+    def new_drop(self, labels=None, axis=0, *args, **kwargs):
+        if args:
+            axis = args[0]
+        return old_drop(self, labels=labels, axis=axis, **kwargs)
+    pd.DataFrame.drop = new_drop
+
+    # Patch pd.concat
+    old_concat = pd.concat
+    def new_concat(objs, *args, **kwargs):
+        if args:
+            # If they passed axis positionally (like 1), map it
+            kwargs["axis"] = args[0]
+        return old_concat(objs, **kwargs)
+    pd.concat = new_concat
+# ---------------------------------------------------------------
+
+
+from obp.dataset import OpenBanditDataset
+
+# Your project imports (make sure this package is importable)
 from impatient_bandits import (
-        ContextualBayesianBandit,
-        ProgressiveBelief,
-        EmpiricalDistribution,
-        Environment,
-        StickinessHelper,
-        DirectMethodModel,
-        evaluate_offline,
-        LoggedStep
- )
+    ProgressiveBelief,
+    EmpiricalDistribution,
+    Environment,
+    StickinessHelper,
+    ContextualBayesianBandit,
+    evaluate_offline,
+    DirectMethodModel,
+    LoggedStep
+)
 
+# # OPE helpers from your codebase (adjust import path if different)
+# from impatient_contextual.ope import (
+#     SoftmaxLoggingPolicy,
+#     collect_logged_data,
+#     DirectMethodModel,
+#     evaluate_offline,
+#     LoggedStep,
+# )
 
-# Logged entry
-@dataclass
-class SimpleLoggedStep:
-    x: np.ndarray
-    a: Any
-    r: float
-    p_b: float
-    t: int
-    ctx_id: Optional[int] = None
+# -------------------------------
+# USER-TUNABLE PARAMETERS
+# -------------------------------
+DATA_DIR = Path("./obd")                 # where OBP will download/store the dataset
+OUTPUT_DIR = Path("./data")              # where results/agents/plots are saved
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# Canonical feature pool (order matters)
-CANONICAL_FEATURES = [
-    "age",
-    "device_mobile",
-    "recent_eng",
-    "premium",
-    "time_of_day",
-    "watch_time",
-    "session_length",
-    "is_weekend",
-    "location_norm",
-    "hour_of_day",
-]
+CAMPAIGN = "all"                         # OBP campaigns: 'all', 'men', 'women'
+BEHAVIOR_POLICY_TO_DOWNLOAD = "random"   # raw logs to download: 'random' or 'bts'
+W = 30                                   # stickiness window days (choose 30 or 59)
+TOP_N_ITEMS = 200                        # keep top-N frequent items to ensure sufficient traces
+MIN_TRACES_PER_ITEM = 50                 # require at least this many starting impressions per item
+PROP_MC = 500                            # MC draws to estimate Thompson propensities (500-2000)
+HORIZON = 180                            # how many rounds to simulate per trial (matching earlier)
+N_TRIALS = 3                             # number of repeated trials (kept small)
+CONTEXT_DIM = 4                          # if dataset contexts absent, we'll fallback to this + intercept
+SEED = 1
 
-# Generators for canonical features (used to fill defaults)
-def _gen_age(rng): return float(rng.uniform(0, 1))
-def _gen_mobile(rng): return int(rng.binomial(1, 0.6))
-def _gen_recent_eng(rng): return float(np.tanh(rng.exponential(1.0) / 2.0))
-def _gen_premium(rng): return int(rng.binomial(1, 0.2))
-def _gen_time_of_day(rng): return float(rng.uniform(0, 1))
-def _gen_watch_time(rng): return float(np.clip(rng.exponential(0.2), 0.0, 1.0))
-def _gen_session_length(rng): return float(np.clip(rng.exponential(0.5), 0.0, 1.0))
-def _gen_is_weekend(rng): return int(rng.binomial(1, 0.28))
-def _gen_location_norm(rng): return float(rng.integers(0, 100) / 99.0)
-def _gen_hour_of_day(rng): return float(rng.integers(0, 23) / 23.0)
+rng = np.random.default_rng(SEED)
 
-FEATURE_GENERATORS = {
-    "age": _gen_age,
-    "device_mobile": _gen_mobile,
-    "recent_eng": _gen_recent_eng,
-    "premium": _gen_premium,
-    "time_of_day": _gen_time_of_day,
-    "watch_time": _gen_watch_time,
-    "session_length": _gen_session_length,
-    "is_weekend": _gen_is_weekend,
-    "location_norm": _gen_location_norm,
-    "hour_of_day": _gen_hour_of_day,
-}
+# -------------------------------
+# Step 0: helper utilities
+# -------------------------------
+def ensure_obd_downloaded(behavior_policy: str, campaign: str, data_path: Path):
+    """
+    Use OBP OpenBanditDataset to download & preprocess the requested campaign data.
+    This uses the OpenBanditDataset class which will download CSVs to data_path if needed.
+    """
+    print(f"Downloading / loading Open Bandit Dataset (policy={behavior_policy}, campaign={campaign}) ...")
+    dataset = OpenBanditDataset(behavior_policy=behavior_policy, campaign=campaign, data_path=data_path)
+    # obtain_bandit: will load and preprocess; returns dict of arrays
+    bandit_feedback = dataset.obtain_batch_bandit_feedback()
+    # raw DataFrame for fine-grained trace construction:
+    raw_df = dataset.data  # dataframe with timestamp/item_id/user_id/reward etc.
+    print("Loaded dataset; n_rounds:", bandit_feedback.get("n_rounds", None))
+    return dataset, bandit_feedback, raw_df
 
-def feature_label(name: str) -> str:
-    return name.replace("_", " ").title()
+def to_day_bucket(ts_series):
+    """
+    Convert a timestamp series (seconds) into integer day buckets relative to min timestamp.
+    OBP timestamps are UNIX-like integers; if not, this function will try to coerce.
+    """
+    # safe conversion
+    try:
+        ts = pd.to_datetime(ts_series, unit="s")
+    except Exception:
+        ts = pd.to_datetime(ts_series)
+    days = (ts - ts.min()).dt.days
+    return days.values
 
-# Safe vector functions
-def _safe_align_vec(vec: np.ndarray, target_len: int) -> np.ndarray:
+# -------------------------------
+# Step 1: Load OBD and inspect repeats
+# -------------------------------
+dataset, bandit_feedback, raw_df = ensure_obd_downloaded(BEHAVIOR_POLICY_TO_DOWNLOAD, CAMPAIGN, DATA_DIR)
+
+if "reward" not in raw_df.columns:
+    if "click" in raw_df.columns:
+        raw_df=raw_df.rename(columns={"click":"reward"})
+    else:
+        raw_df["reward"]=bandit_feedback["reward"]
+
+if "user_id" not in raw_df.columns:
+    raw_df["user_id"]=np.arange(len(raw_df))
+
+if "timestamp" not in raw_df.columns:
+    if "time" in raw_df.columns:
+        raw_df=raw_df.rename(columns={"time":"timestamp"})
+    else:
+        raw_df["timestamp"]=np.arange(len(raw_df))
+
+# Ensure expected columns exist
+expected_cols = {"user_id", "item_id", "timestamp", "reward"}
+if not expected_cols.issubset(set(raw_df.columns)):
+    raise RuntimeError(f"Unexpected raw data columns: missing {expected_cols - set(raw_df.columns)}")
+
+# create day-buckets to make day-offset lookups easier
+raw_df = raw_df.sort_values("timestamp").reset_index(drop=True)
+raw_df["day"] = to_day_bucket(raw_df["timestamp"])  # integer day index relative to dataset start
+
+print("Raw df rows:", len(raw_df), "unique items:", raw_df["item_id"].nunique())
+
+# -------------------------------
+# Step 2: Build per-item empirical traces
+# -------------------------------
+# We will construct traces as follows:
+# For each sampled impression row r (user u, item i, day d0),
+# create trace[k] = 1 if there exists an impression in the raw_df with same (user_id, item_id)
+# at day == d0 + k which had reward==1. 0 otherwise.
+#
+# This captures repeated interactions (if any). If repeated user-item interactions are rare,
+# traces will be sparse; but aggregated traces across many impressions still capture
+# the per-item time-profile for repeat engagement.
+#
+# If an item has < MIN_TRACES_PER_ITEM starting impressions, we drop it from the candidate pool.
+
+print("Constructing per-item traces (this can take some minutes)...")
+top_items = raw_df["item_id"].value_counts().index[: TOP_N_ITEMS]
+print(f"Selected top {len(top_items)} items by impression count.")
+
+item_traces = {}  # item_id -> ndarray shape (n_samples, W)
+for item in tqdm(top_items, desc="items"):
+    sub = raw_df[raw_df["item_id"] == item].copy()
+    if len(sub) < MIN_TRACES_PER_ITEM:
+        continue
+    # sample up to max_samples starting impressions uniformly to make computation bounded
+    max_samples = min(len(sub), 1000)
+    sampled_idx = rng.choice(sub.index.values, size=max_samples, replace=False)
+    traces_list = []
+    for idx in sampled_idx:
+        row = raw_df.loc[idx]
+        uid = row["user_id"]
+        day0 = int(row["day"])
+        # for offsets 0..W-1, check existence of same (uid,item) with click at day0+offset
+        # Use DataFrame boolean mask for speed: build once outside loop? We'll do small window checks
+        trace = np.zeros(W, dtype=float)
+        # Once we find a future impression for that (uid,item), mark its reward if present
+        # Because repetitions are rare, this will be mostly zeros, but that's expected.
+        future_days = raw_df[
+            (raw_df["user_id"] == uid) & (raw_df["item_id"] == item) & (raw_df["day"] >= day0)
+        ]
+        # For each unique day in future_days, set trace offset if reward==1
+        for _, frow in future_days.iterrows():
+            offset = int(frow["day"] - day0)
+            if 0 <= offset < W:
+                if float(frow["reward"]) > 0:
+                    trace[offset] = 1.0
+        traces_list.append(trace)
+    if len(traces_list) >= MIN_TRACES_PER_ITEM:
+        item_traces[item] = np.vstack(traces_list)  # shape (m, W)
+
+print(f"Constructed empirical traces for {len(item_traces)} items (min required {MIN_TRACES_PER_ITEM}).")
+if len(item_traces) == 0:
+    raise RuntimeError("No items with enough repeated impressions were found. Try lowering MIN_TRACES_PER_ITEM or TOP_N_ITEMS.")
+
+# -------------------------------
+# Step 3: Compute priors via StickinessHelper
+# -------------------------------
+print("Estimating priors from empirical traces (StickinessHelper)...")
+from impatient_bandits import StickinessHelper
+
+helper = StickinessHelper.from_data(item_traces)  # uses your helper.from_data
+prior_mvec = helper.prior_mvec
+prior_cmat = helper.prior_cmat
+noise_cmat = helper.noise_cmat
+
+print("Prior mean vector length:", len(prior_mvec), "expected w:", W)
+# If your helper returns a prior_mvec shorter/longer than W, we will align:
+if len(prior_mvec) != W:
+    # pad or truncate in a safe way
+    m = len(prior_mvec)
+    if m < W:
+        # pad with small values at the end
+        prior_mvec = np.concatenate([prior_mvec, np.full(W - m, prior_mvec[-1] if m > 0 else 0.0)])
+        # expand cmat/noise accordingly (pad diag)
+        old = prior_cmat
+        new = np.zeros((W, W), dtype=float)
+        new[:m, :m] = old
+        new[m:, m:] = np.eye(W - m) * 1e-6
+        prior_cmat = new
+        noise_new = np.zeros((W, W), dtype=float)
+        noise_new[:m, :m] = noise_cmat
+        noise_new[m:, m:] = np.eye(W - m) * 1e-6
+        noise_cmat = noise_new
+    else:
+        prior_mvec = prior_mvec[:W]
+        prior_cmat = prior_cmat[:W, :W]
+        noise_cmat = noise_cmat[:W, :W]
+
+# -------------------------------
+# Step 4: Build EmpiricalDistribution objects and Environment
+# -------------------------------
+print("Building EmpiricalDistribution objects for simulation environment...")
+from impatient_bandits import EmpiricalDistribution
+
+# Keep an index mapping of item -> EmpiricalDistribution
+selected_items = sorted(item_traces.keys())[: min(len(item_traces), TOP_N_ITEMS)]  # deterministic order
+N_items = len(selected_items)
+print(f"Using {N_items} items for simulation.")
+
+dists = {}
+for item in selected_items:
+    traces = item_traces[item]  # shape (m, W)
+    # EmpiricalDistribution expects binary traces shape (n_samples, w)
+    # The constructor from your code requires a seed (int). use rng for int seeds
+    seed_int = int(rng.integers(0, 2**31 - 1))
+    dists[item] = EmpiricalDistribution(traces.copy(), seed=seed_int)
+
+env = Environment(dists)
+
+# -------------------------------
+# Step 5: Build context generator + true_theta mapping
+# -------------------------------
+# We will try to reuse dataset contexts if available; otherwise fall back to synthetic contexts.
+bandit_fb = bandit_feedback  # dict returned by OBP
+context_arr = bandit_fb.get("context", None)  # can be None or dict/ndarray
+
+if context_arr is not None:
+    # If context is a dict (feature-name -> array), stack into matrix.
+    if isinstance(context_arr, dict):
+        # convert dict of arrays to (n_rounds, n_features)
+        example_vals = list(context_arr.values())
+        if len(example_vals) == 0:
+            use_synthetic_contexts = True
+        else:
+            # stack along axis 1 (columns)
+            try:
+                contexts = np.vstack([context_arr[k] for k in sorted(context_arr.keys())]).T
+                use_synthetic_contexts = False
+                print("Using dataset-supplied contexts, shape:", contexts.shape)
+            except Exception:
+                use_synthetic_contexts = True
+    elif isinstance(context_arr, np.ndarray):
+        contexts = context_arr
+        use_synthetic_contexts = False
+        print("Using dataset-supplied contexts, shape:", contexts.shape)
+    else:
+        use_synthetic_contexts = True
+else:
+    use_synthetic_contexts = True
+
+if use_synthetic_contexts:
+    print("Dataset contexts not suitable; generating synthetic contexts (random) instead.")
+    # generate many contexts to sample from during simulation
+    # use small context_dim features plus intercept
+    base_ctx = np.random.default_rng(SEED).normal(size=(1000, CONTEXT_DIM))
+    # add intercept later when using
+else:
+    # contexts may not match required CONTEXT_DIM; if mismatch, reduce or pad
+    if contexts.ndim == 1:
+        contexts = contexts.reshape(-1, 1)
+    if contexts.shape[1] < CONTEXT_DIM:
+        # pad with zeros
+        pad = np.zeros((contexts.shape[0], CONTEXT_DIM - contexts.shape[1]))
+        contexts = np.hstack([contexts[:, :CONTEXT_DIM], pad])
+    elif contexts.shape[1] > CONTEXT_DIM:
+        contexts = contexts[:, :CONTEXT_DIM]
+
+# Build per-item true_theta (how context shifts engagement) similar to Spotify setup
+true_theta = {}
+for item in selected_items:
+    true_theta[item] = rng.normal(scale=0.8, size=(CONTEXT_DIM + 1,))
+
+# generator_fn that samples a trace for an arm and optionally modulates by context via scaling
+day_decay = np.linspace(1.0, 0.6, W)
+
+def generate_trace_for_arm_using_empirical(arm, context, n_samples=1):
+    """
+    Draw n_samples traces for this arm from its empirical distribution in env.dists.
+    Optionally modulate sampling by context via rejection sampling is possible, but here we
+    simply resample the empirical traces and (optionally) flip some bits according to context.
+    """
+    # base draws
+    draws = env.dists[arm].sample(n=n_samples)
+    # Optionally modulate by context: here we scale probability of ones by a sigmoid of true_theta @ context
+    try:
+        ctx = np.asarray(context).reshape(-1)
+    except Exception:
+        ctx = np.zeros(CONTEXT_DIM + 1)
+    mu = float(true_theta[arm] @ ctx)  # scalar
+    # scale in [0.5, 1.0]
+    scale = 0.5 * (1.0 / (1.0 + np.exp(-mu))) + 0.5
+    # Weigh each day in trace: flip some zeros->ones with small prob if scale>0.5 (light augmentation).
+    # This is optional; keep it conservative (only gently scale).
+    if scale != 1.0:
+        # For each draw, for each day, we flip some zeros->ones with probability (scale - 0.5)*0.2 (small)
+        flip_p = max(0.0, (scale - 0.5) * 0.2)
+        if flip_p > 0:
+            flips = rng.random(draws.shape) < flip_p
+            draws = np.clip(draws + flips.astype(float), 0.0, 1.0)
+    return draws.astype(float)
+
+# A helper to draw random contexts for simulation
+def sample_context():
+    if use_synthetic_contexts:
+        ix = rng.integers(0, base_ctx.shape[0])
+        raw = base_ctx[ix]
+    else:
+        ix = rng.integers(0, contexts.shape[0])
+        raw = contexts[ix]
+    # prepend intercept
+    return np.concatenate([[1.0], np.asarray(raw).reshape(-1)])  # length CONTEXT_DIM+1
+
+# -------------------------------
+# Step 6: Thompson-prob MC and logged training function (robust)
+# -------------------------------
+from numpy.linalg import inv as np_inv
+
+def _safe_align(vec, target_len):
     v = np.asarray(vec).reshape(-1)
     if v.size == target_len:
         return v.astype(float)
@@ -82,902 +368,248 @@ def _safe_align_vec(vec: np.ndarray, target_len: int) -> np.ndarray:
         return out
     return v[:target_len].astype(float)
 
-def _safe_posterior_mean_of_model(model, target_len: int) -> np.ndarray:
-    try:
-        pm = model.posterior_mean()
-        arr = np.asarray(pm).reshape(-1)
-    except Exception:
-        return np.zeros(target_len, dtype=float)
-    return _safe_align_vec(arr, target_len)
+def estimate_thompson_probas(agent, context, B=PROP_MC, rng_local=None):
+    if rng_local is None:
+        rng_local = np.random.default_rng(int(rng.integers(0, 2**31 - 1)))
+    arms = agent.arms
+    K = len(arms)
+    x = np.asarray(context).reshape(-1)
+    dim_x = x.size
+    values = np.full((K, B), -np.inf, dtype=float)
 
-class ModelService:
-    def __init__(
-        self,
-        train_pkl: str = "data/synthetic-data-train.pkl",
-        eval_pkl: str = "data/synthetic-data-eval.pkl",
-        context_dim: int = 4,
-        pb_weight: float = 0.6,
-        sigma2: float = 0.25,
-        rng_seed: int = 1,
-    ):
-        self.train_pkl = train_pkl
-        self.eval_pkl = eval_pkl
-        self.context_dim = int(context_dim)
-        self.pb_weight = float(pb_weight)
-        self.sigma2 = float(sigma2)
-        self.rng = np.random.default_rng(int(rng_seed))
-
-        self.helper: Optional[StickinessHelper] = None
-        self.env: Optional[Environment] = None
-        self.item_traces: Optional[Dict[str, np.ndarray]] = None
-        self.empirical_means: Optional[Dict[str, np.ndarray]] = None
-        self.agent: Optional[ContextualBayesianBandit] = None
-
-        # feature/instance state
-        self.canonical_features = CANONICAL_FEATURES.copy()
-        self.selected_features: List[str] = CANONICAL_FEATURES[:4]
-        self.context_instances: List[Dict[str, Any]] = []
-
-        # trace-related
-        self.w: Optional[int] = None
-        self.day_decay: Optional[np.ndarray] = None
-        self.true_theta: Optional[Dict[str, np.ndarray]] = None
-
-        # logging
-        self.logged: List[SimpleLoggedStep] = []
-
-        # init from pickles
-        self._init_from_pickles()
-        if len(self.context_instances) == 0:
-            self.generate_random_instances(5)
-
-    # -------------------
-    # init/load
-    # -------------------
-    def _load_pickle(self, path):
-        with open(path, "rb") as fh:
-            return pickle.load(fh)
-
-    def _init_from_pickles(self):
-        # load eval pkl to build env & empirical means
-        if os.path.exists(self.eval_pkl):
+    for i, a in enumerate(arms):
+        try:
+            model = agent.models[a]
+            Lambda = np.asarray(model.Lambda)
+            # invert safely
             try:
-                data_eval = self._load_pickle(self.eval_pkl)
-                item_traces = {k: v.astype(float) for k, v in data_eval.items() if v is not None and len(v) > 0}
-                if len(item_traces) > 0:
-                    self.item_traces = item_traces
-                    self.empirical_means = {k: np.mean(v, axis=0) for k, v in item_traces.items()}
-                    # compute w and day_decay
-                    any_arm = next(iter(self.empirical_means.values()))
-                    self.w = any_arm.shape[0]
-                    self.day_decay = np.linspace(1.0, 0.6, self.w)
-                    # env
-                    dists = {}
-                    for uri, traces in item_traces.items():
-                        seed_int = int(self.rng.integers(0, 2 ** 31 - 1))
-                        dists[uri] = EmpiricalDistribution(traces.copy(), seed=seed_int)
-                    self.env = Environment(dists)
-                    # create true_theta mapping same style as main.py
-                    self.true_theta = {uri: self.rng.normal(scale=0.8, size=(self.context_dim + 1,)) for uri in item_traces}
-            except Exception as e:
-                print("Warning: failed to init eval env from pkl:", e)
-
-        # load training priors
-        if os.path.exists(self.train_pkl):
-            try:
-                train_data = self._load_pickle(self.train_pkl)
-                train_data = {k: v.astype(float) for k, v in train_data.items() if v is not None and len(v) > 0}
-                if len(train_data) > 0:
-                    self.helper = StickinessHelper.from_data(train_data)
-            except Exception as e:
-                print("Warning: failed to init helper from train pkl:", e)
-
-    # -------------------
-    # instance utilities
-    # -------------------
-    def _fill_instance_defaults(self, instance: Dict[str, Any]) -> Dict[str, Any]:
-        for f in self.canonical_features:
-            if f not in instance:
-                gen = FEATURE_GENERATORS.get(f)
-                try:
-                    instance[f] = gen(self.rng) if gen is not None else 0.0
-                except Exception:
-                    instance[f] = 0.0
-        return instance
-
-    def add_context_instance(self, ctx: Dict[str, Any]) -> int:
-        inst = dict(ctx)
-        inst = self._fill_instance_defaults(inst)
-        self.context_instances.append(inst)
-        return len(self.context_instances) - 1
-
-    def update_context_instance(self, idx: int, ctx: Dict[str, Any]):
-        if idx < 0 or idx >= len(self.context_instances):
-            raise IndexError("context instance idx out of range")
-        inst = dict(ctx)
-        inst = self._fill_instance_defaults(inst)
-        self.context_instances[idx] = inst
-
-    def remove_context_instance(self, idx: int):
-        if idx < 0 or idx >= len(self.context_instances):
-            raise IndexError("context instance idx out of range")
-        del self.context_instances[idx]
-
-    def get_context_instances(self) -> List[Dict[str, Any]]:
-        return [dict(c) for c in self.context_instances]
-
-    def generate_random_instances(self, n: int = 5, selected_features: Optional[List[str]] = None) -> List[int]:
-        if selected_features is None:
-            selected_features = self.selected_features
-        ids = []
-        for _ in range(n):
-            inst = {}
-            for f in self.canonical_features:
-                gen = FEATURE_GENERATORS.get(f)
-                if f in selected_features and gen is not None:
-                    inst[f] = gen(self.rng)
-                else:
-                    inst[f] = gen(self.rng) if gen is not None else 0.0
-            idx = self.add_context_instance(inst)
-            ids.append(idx)
-        return ids
-
-    # -------------------
-    # feature selection
-    # -------------------
-    def get_feature_pool(self):
-        return [{"name": f, "label": feature_label(f), "selected": f in self.selected_features} for f in self.canonical_features]
-
-    def set_selected_features(self, selected: List[str]):
-        selected = [s for s in selected if s in self.canonical_features]
-        if len(selected) == 0:
-            raise ValueError("At least one feature must be selected")
-        self.selected_features = selected
-        # retrofill existing instances so they have values for all canonical features
-        for inst in self.context_instances:
-            self._fill_instance_defaults(inst)
-
-    def get_selected_features(self):
-        return list(self.selected_features)
-
-    # -------------------
-    # agent lifecycle
-    # -------------------
-    def create_fresh_agent(self, belief_cls=ProgressiveBelief) -> ContextualBayesianBandit:
-        if self.env is None:
-            raise RuntimeError("No environment constructed (need eval pkl).")
-        if self.helper is None:
-            raise RuntimeError("No stickiness helper available (need train pkl).")
-        beliefs = {}
-        for uri in self.env.dists.keys():
-            beliefs[uri] = belief_cls(
-                prior_mvec=self.helper.prior_mvec.copy(),
-                prior_cmat=self.helper.prior_cmat.copy(),
-                noise_cmat=self.helper.noise_cmat.copy(),
-                cov_estimator="fixed",
-                seed=int(self.rng.integers(0, 2 ** 31 - 1)),
-            )
-        agent = ContextualBayesianBandit(beliefs, dim=self.context_dim + 1, alpha=1.0, sigma2=self.sigma2, pb_weight=self.pb_weight, seed=int(self.rng.integers(0, 2 ** 31 - 1)))
-        self.agent = agent
-        return agent
-
-    def load_agent(self, path: str):
-        with open(path, "rb") as fh:
-            self.agent = pickle.load(fh)
-        return self.agent
-
-    def save_agent(self, path: str):
-        if self.agent is None:
-            raise RuntimeError("No agent to save")
-        with open(path, "wb") as fh:
-            pickle.dump(self.agent, fh, protocol=pickle.HIGHEST_PROTOCOL)
-
-    # -------------------
-    # context vector building
-    # -------------------
-    def build_full_vector_from_instance(self, instance: Dict[str, Any]) -> np.ndarray:
-        values = [1.0]
-        for f in self.canonical_features:
-            v = instance.get(f, 0.0)
-            try:
-                values.append(float(v))
+                cov = np.linalg.inv(Lambda)
             except Exception:
-                try:
-                    values.append(float(int(v)))
-                except Exception:
-                    values.append(0.0)
-        vec = np.asarray(values, dtype=float).reshape(-1)
-        vec = _safe_align_vec(vec, self.context_dim + 1)
-        return vec
-    
-    # -------------------
-    # context-dependent generator (MATCHES main.py)
-    # -------------------
-    def _generate_trace_for_arm(self, arm: str, context: np.ndarray, n_samples: int = 1):
-        """
-        Compute context-scaled day probabilities and sample binary traces.
-        Mirrors main.py: base=empirical_means[arm], mu=true_theta[arm] @ context,
-        scale = 0.5 * sigmoid(mu) + 0.5, probs = clip(base*scale*day_decay).
-        """
-        if self.empirical_means is None or self.day_decay is None or self.true_theta is None:
-            # fallback to empirical sampling
-            try:
-                return self.env.dists[arm].sample(n=n_samples)
-            except Exception:
-                # fallback zeros
-                w = self.w or 59
-                return np.zeros((n_samples, w), dtype=float)
-        base = self.empirical_means[arm]
-        # ensure context shape
-        x = np.asarray(context).reshape(-1)
-        # align x to expected size (context_dim+1)
-        x = _safe_align_vec(x, self.context_dim + 1)
-        mu = float(self.true_theta[arm] @ x)
-        scale = 0.5 * (1.0 / (1.0 + np.exp(-mu))) + 0.5
-        probs = np.clip(base * scale * self.day_decay, 1e-6, 1 - 1e-6)
-        samples = self.rng.binomial(1, probs, size=(n_samples, self.w)).astype(float)
-        return samples
+                cov = np.linalg.pinv(Lambda)
+            mean = _safe_align(model.posterior_mean(), dim_x)
+        except Exception:
+            mean = np.zeros(dim_x, dtype=float)
+            cov = np.eye(dim_x, dtype=float) * 1e-6
 
-    def expected_reward_for_arm(self, arm: str, context: np.ndarray) -> float:
-        if self.empirical_means is None or self.day_decay is None or self.true_theta is None:
-            # fallback: empirical mean sum (context-agnostic)
+        try:
+            bel = agent.beliefs[a]
             try:
-                return 1.0 + self.empirical_means[arm].sum()
-            except Exception:
-                return 0.0
-        base = self.empirical_means[arm]
-        x = _safe_align_vec(np.asarray(context).reshape(-1), self.context_dim + 1)
-        mu = float(self.true_theta[arm] @ x)
-        scale = 0.5 * (1.0 / (1.0 + np.exp(-mu))) + 0.5
-        probs = np.clip(base * scale * self.day_decay, 1e-6, 1 - 1e-6)
-        return 1.0 + probs.sum()
-
-    # -------------------
-    # Thompson propensity estimator
-    # -------------------
-    def estimate_thompson_probas(self, context: np.ndarray, B: int = 500) -> Dict[str, float]:
-        if self.agent is None:
-            raise RuntimeError("No agent loaded")
-        agent = self.agent
-        arms = agent.arms
-        K = len(arms)
-        x = _safe_align_vec(np.asarray(context).reshape(-1), self.context_dim + 1)
-        dim_x = x.size
-        values = np.full((K, B), -np.inf, dtype=float)
-        rng_local = np.random.default_rng(int(self.rng.integers(0, 2 ** 31 - 1)))
-        for i, a in enumerate(arms):
-            try:
-                model = agent.models[a]
-                Lambda = np.atleast_2d(np.asarray(model.Lambda))
-                try:
-                    cov = np.linalg.inv(Lambda)
-                except Exception:
-                    cov = np.linalg.pinv(Lambda)
-                mean = _safe_posterior_mean_of_model(model, Lambda.shape[0])
-            except Exception:
-                mean = np.zeros(dim_x, dtype=float)
-                cov = np.eye(dim_x, dtype=float) * 1e-6
-            if cov.shape[0] != dim_x or cov.shape[1] != dim_x:
-                if cov.shape[0] >= dim_x and cov.shape[1] >= dim_x:
-                    cov = cov[:dim_x, :dim_x]
-                else:
-                    newcov = np.eye(dim_x, dtype=float) * 1e-6
-                    newcov[: cov.shape[0], : cov.shape[1]] = cov
-                    cov = newcov
-                mean = _safe_align_vec(mean, dim_x)
-            else:
-                mean = _safe_align_vec(mean, dim_x)
-            try:
-                bel = agent.beliefs[a]
                 if getattr(bel, "has_new_obs", False) or getattr(bel, "t_post", None) != getattr(agent, "t", None):
                     bel.compute_posterior(getattr(agent, "t", 0))
-                pb_mean = float(getattr(bel, "mean", 0.0))
-                pb_var = float(getattr(bel, "var", 0.0))
-                pb_std = float(np.sqrt(max(pb_var, 1e-12)))
             except Exception:
-                pb_mean, pb_std = 0.0, 1e-6
-            try:
-                thetas = rng_local.multivariate_normal(mean, cov, size=B)
-            except Exception:
-                thetas = np.tile(mean.reshape(1, -1), (B, 1))
-            preds = thetas @ x
-            pb_samples = pb_mean + pb_std * rng_local.standard_normal(size=B)
-            pw = float(getattr(agent, "pb_weight", self.pb_weight))
-            values[i, :] = preds + pw * pb_samples
-        chosen = np.argmax(values, axis=0)
-        counts = np.bincount(chosen, minlength=K)
-        probas = counts.astype(float) / float(B)
-        return {arms[i]: float(probas[i]) for i in range(K)}
-
-    # -------------------
-    # greedy action
-    # -------------------
-    def greedy_action(self, context_vec: np.ndarray, n_actions: int = 1) -> List[Any]:
-        if self.agent is None:
-            raise RuntimeError("No agent loaded")
-        x = _safe_align_vec(np.asarray(context_vec).reshape(-1), self.context_dim + 1)
-        arms = self.agent.arms
-        values = []
-        for a in arms:
-            try:
-                theta = _safe_posterior_mean_of_model(self.agent.models[a], x.size)
-            except Exception:
-                theta = np.zeros(x.size)
-            theta = _safe_align_vec(theta, x.size)
-            pred = float(theta @ x)
+                pass
+            pb_mean = float(getattr(bel, "mean", 0.0))
+            pb_var = float(getattr(bel, "var", 0.0))
+            pb_std = math.sqrt(max(pb_var, 1e-12))
+        except Exception:
             pb_mean = 0.0
-            try:
-                bel = self.agent.beliefs[a]
-                if getattr(bel, "has_new_obs", False) or getattr(bel, "t_post", None) != getattr(self.agent, "t", None):
-                    bel.compute_posterior(getattr(self.agent, "t", 0))
-                pb_mean = float(getattr(bel, "mean", 0.0))
-            except Exception:
+            pb_std = 1e-6
+
+        # sample thetas (B x dim_x)
+        try:
+            thetas = rng_local.multivariate_normal(mean, cov, size=B)
+            thetas = np.atleast_2d(thetas)
+            if thetas.shape[1] != dim_x:
+                tmp = np.zeros((B, dim_x))
+                tmp[:, : thetas.shape[1]] = thetas[:, :min(thetas.shape[1], dim_x)]
+                thetas = tmp
+        except Exception:
+            thetas = np.tile(mean.reshape(1, -1), (B, 1))
+
+        preds = thetas @ x
+        pb_samples = pb_mean + pb_std * rng_local.standard_normal(size=B)
+        pw = float(getattr(agent, "pb_weight", 1.0))
+        values[i, :] = preds + pw * pb_samples
+
+    chosen = np.argmax(values, axis=0)
+    counts = np.bincount(chosen, minlength=K)
+    probas = counts.astype(float) / float(B)
+    return {arms[i]: float(probas[i]) for i in range(K)}
+
+# Reuse your bandit trial with logging (adapted to use generator_fn above)
+def bandit_trial_with_logging(env, beliefs, horizon, n_actions, agent_seed=None, generator_fn=None, propensity_mc=PROP_MC):
+    agent = ContextualBayesianBandit(beliefs, dim=CONTEXT_DIM + 1, alpha=1.0, sigma2=0.25, pb_weight=pb_weight, seed=agent_seed)
+    regrets = []
+    entropies = []
+    logged_dataset = []
+
+    rng_local = np.random.default_rng(int(rng.integers(0,2**31-1)))
+
+    for t in range(horizon):
+        context = sample_context()
+        actions = agent.act(context, n_actions=n_actions)
+
+        # estimate propensities under current agent posterior
+        try:
+            probas = estimate_thompson_probas(agent, context, B=propensity_mc, rng_local=rng_local)
+        except Exception:
+            probas = {a: 1.0 / len(agent.arms) for a in agent.arms}
+
+        # interact and log: for each selected action, sample full empirical trace (generator_fn) and update
+        for a in actions:
+            p_b = max(probas.get(a, 0.0), 1e-12)
+            trace = generator_fn(a, context, n_samples=1)  # (1, W)
+            r = float(1.0 + trace.sum())
+            logged_dataset.append(LoggedStep(x=context.copy(), a=a, r=r, p_b=p_b, t=t))
+            # update agent
+            agent.update(a, trace, context)
+
+        agent.step()
+
+        # compute regret w.r.t. oracle expected reward (approx using empirical mean per item)
+        true_rewards = np.array([1.0 + item_traces[a].mean(axis=0).sum() if a in item_traces else 0.0 for a in actions])
+        # r_opt: best possible single arm expected reward
+        r_opt = max((1.0 + item_traces[it].mean(axis=0).sum()) for it in item_traces.keys())
+        regrets.append(np.mean(r_opt - true_rewards))
+        # entropy of the selected set (counts)
+        _, counts = np.unique(actions, return_counts=True)
+        probs = counts / counts.sum()
+        entropies.append(-np.sum(probs * np.log(probs + 1e-12)))
+
+    return np.array(regrets), np.array(entropies), agent, logged_dataset
+
+# -------------------------------
+# Step 7: Run experiments comparing Progressive vs baseline (context-only)
+# -------------------------------
+# We'll do a few trials where we:
+#  - init beliefs for all items using computed priors
+#  - run bandit_trial_with_logging for Progressive (pb_weight>0) and Baseline (pb_weight=0)
+#  - compute cumulative regret curves and OPE results
+
+results = {}
+n_actions_to_test = 3  # you may change this; testing with 3 recommendations per context to be realistic
+pb_weight = 0.6        # same as earlier main.py
+
+for policy_name, pb_weight_setting in [("Progressive", 0.6), ("ContextOnly", 0.0), ("Dummy", 0.0)]:
+    print("=== Running trials for policy:", policy_name, "pb_weight:", pb_weight_setting)
+    all_regrets = np.zeros((N_TRIALS, HORIZON))
+    all_ent = np.zeros((N_TRIALS, HORIZON))
+    last_agent = None
+    last_logged = None
+    for trial in range(N_TRIALS):
+        # initialize beliefs per item
+        beliefs = {}
+        # use a new random seed per trial
+        seed_int = int(rng.integers(0, 2**31 - 1))
+        for item in selected_items:
+            beliefs[item] = ProgressiveBelief(prior_mvec=prior_mvec.copy(), prior_cmat=prior_cmat.copy(), noise_cmat=noise_cmat.copy(), cov_estimator="fixed", seed=int(rng.integers(0,2**31-1)))
+        # Run trial simulation
+        # set global pb_weight for the ContextualBayesianBandit by passing into constructor; we used pb_weight variable in builder above
+        pb_weight = pb_weight_setting
+        reg, ent, trained_agent, logged = bandit_trial_with_logging(env, beliefs, HORIZON, n_actions_to_test, agent_seed=seed_int, generator_fn=generate_trace_for_arm_using_empirical, propensity_mc=PROP_MC)
+        all_regrets[trial] = reg
+        all_ent[trial] = ent
+        last_agent = trained_agent
+        last_logged = logged
+        print(".", end="", flush=True)
+    print()
+
+    # save last agent
+    fname = OUTPUT_DIR / f"trained_agent_{policy_name}_n{n_actions_to_test}.pkl"
+    with open(fname, "wb") as fh:
+        pickle.dump(last_agent, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    print("Saved agent:", fname)
+
+    # store results and last_logged for OPE
+    results[policy_name] = {
+        "regrets": all_regrets,
+        "ent": all_ent,
+        "trained_agent": last_agent,
+        "logged": last_logged,
+    }
+
+# -------------------------------
+# Step 8: Plot cumulative regret (averaged across trials)
+# -------------------------------
+plt.figure(figsize=(10,6))
+xs = np.arange(1, HORIZON + 1)
+colors = {"Progressive":"C0", "ContextOnly":"C1", "Dummy":"C2"}
+
+for name in results:
+    arr = results[name]["regrets"]
+    areg = np.cumsum(arr, axis=1) / xs
+    mean = areg.mean(axis=0)
+    std = areg.std(axis=0)
+    plt.plot(xs, mean, label=name, color=colors.get(name))
+    plt.fill_between(xs, mean-std, mean+std, alpha=0.12, facecolor=colors.get(name))
+plt.xlabel("Round")
+plt.ylabel("Average cumulative regret")
+plt.legend()
+plt.grid(alpha=0.4)
+plt.title("Average cumulative regret")
+plt.savefig(OUTPUT_DIR / "cumulative_regret.png")
+plt.show()
+
+# -------------------------------
+# Step 9: Offline Policy Evaluation (OPE) on the last logged dataset for each policy
+# -------------------------------
+print("\n=== Offline Policy Evaluation (OPE) summaries ===")
+for name, v in results.items():
+    logged_dataset = v["logged"]
+    arms = list(item_traces.keys())
+    dim = CONTEXT_DIM + 1
+
+    # Fit Direct Method model on this logged data ONLY
+    dm_model = DirectMethodModel(arms=arms, dim=dim, alpha=1.0, sigma2=0.25)
+    dm_model.fit(logged_dataset)
+
+    # evaluation policy defined from trained_agent greedy on posterior means
+    def make_eval_fn(agent):
+        def eval_action_fn(x):
+            # greedy as in earlier robust code: deterministic
+            x = np.asarray(x).reshape(-1)
+            best_val = -np.inf
+            best_arm = None
+            for a in arms:
+                try:
+                    theta = agent.models[a].posterior_mean()
+                    theta = np.asarray(theta).reshape(-1)
+                    theta = _safe_align(theta, x.size)
+                except Exception:
+                    theta = np.zeros(x.size)
+                pred = float(theta @ x)
                 pb_mean = 0.0
-            val = pred + float(getattr(self.agent, "pb_weight", self.pb_weight)) * pb_mean
-            values.append(val)
-        idxs = np.argsort(values)[::-1][:n_actions]
-        return [arms[i] for i in idxs]
-
-    # -------------------
-    # predict wrapper
-    # -------------------
-    def predict(self, instance: Optional[Dict[str, Any]] = None, vector: Optional[List[float]] = None, instance_id: Optional[int] = None, n_actions: int = 1, stochastic: bool = False) -> List[Any]:
-        if instance_id is not None:
-            instance = self.context_instances[instance_id]
-        if vector is not None:
-            vec = _safe_align_vec(np.asarray(vector).reshape(-1), self.context_dim + 1)
-        elif instance is not None:
-            vec = self.build_full_vector_from_instance(instance)
-        else:
-            if len(self.context_instances) > 0:
-                vec = self.build_full_vector_from_instance(self.context_instances[self.rng.integers(0, len(self.context_instances))])
-            else:
-                tmp = {}
-                for f in self.selected_features:
-                    gen = FEATURE_GENERATORS.get(f)
-                    tmp[f] = gen(self.rng) if gen is not None else 0.0
-                vec = self.build_full_vector_from_instance(tmp)
-        if stochastic:
-            if self.agent is None:
-                raise RuntimeError("No agent loaded")
-            return self.agent.act(vec, n_actions=n_actions)
-        else:
-            return self.greedy_action(vec, n_actions=n_actions)
-
-    # -------------------
-    # batch_update
-    # -------------------
-    def batch_update(self, updates: List[Dict], log: bool = True) -> int:
-        if self.agent is None:
-            raise RuntimeError("No agent loaded")
-        count = 0
-        for u in updates:
-            a = u["a"]
-            trace = np.atleast_2d(np.asarray(u["trace"], dtype=float))
-            ctx = u.get("context", None)
-            instance_id = u.get("instance_id", None)
-            if ctx is None and instance_id is not None:
-                ctx = self.context_instances[instance_id]
-            if ctx is None:
-                ctx = {}
-            vec = self.build_full_vector_from_instance(ctx)
-            t = int(u.get("t", getattr(self.agent, "t", 0)))
-            try:
-                self.agent.update(a, trace, vec)
-            except Exception:
                 try:
-                    self.agent.beliefs[a].update(trace, t)
-                    self.agent.models[a].update(vec, float(1.0 + trace.sum()))
-                except Exception:
-                    pass
-            p_b = float(u.get("p_b", 0.0))
-            entry = SimpleLoggedStep(x=vec.copy(), a=a, r=float(1.0 + trace.sum()), p_b=p_b, t=t, ctx_id=instance_id)
-            if log:
-                self.logged.append(entry)
-            count += 1
-        return count
-
-    # -------------------
-    # simulate & log (uses context-dependent generator)
-    # -------------------
-    def simulate_and_log(self, horizon: int = 180, n_actions: int = 3, propensity_mc: int = 500, selected_instance_ids: Optional[List[int]] = None, context_mode: str = "random", fresh_agent: bool = True) -> Tuple[np.ndarray, np.ndarray, List[SimpleLoggedStep]]:
-        if self.env is None:
-            raise RuntimeError("No environment constructed - need eval pkl in place.")
-        if self.helper is None:
-            raise RuntimeError("No stickiness helper available - need train pkl.")
-        if fresh_agent or self.agent is None:
-            self.create_fresh_agent(ProgressiveBelief)
-        agent = self.agent
-        arms = list(self.env.dists.keys())
-        logged_run: List[SimpleLoggedStep] = []
-        regrets = []
-        entropies = []
-        rng_local = np.random.default_rng(int(self.rng.integers(0, 2 ** 31 - 1)))
-
-        # build ctx sequence
-        ctx_seq = []
-        if selected_instance_ids:
-            ids = [int(i) for i in selected_instance_ids]
-            if context_mode == "round-robin":
-                for i in range(horizon):
-                    inst = self.context_instances[ids[i % len(ids)]]
-                    ctx_seq.append(self.build_full_vector_from_instance(inst))
-            else:
-                for i in range(horizon):
-                    inst = self.context_instances[ids[rng_local.integers(0, len(ids))]]
-                    ctx_seq.append(self.build_full_vector_from_instance(inst))
-        elif len(self.context_instances) > 0:
-            if context_mode == "round-robin":
-                for i in range(horizon):
-                    inst = self.context_instances[i % len(self.context_instances)]
-                    ctx_seq.append(self.build_full_vector_from_instance(inst))
-            else:
-                for i in range(horizon):
-                    inst = self.context_instances[rng_local.integers(0, len(self.context_instances))]
-                    ctx_seq.append(self.build_full_vector_from_instance(inst))
-        else:
-            for i in range(horizon):
-                inst = {}
-                for f in self.selected_features:
-                    gen = FEATURE_GENERATORS.get(f)
-                    inst[f] = gen(self.rng) if gen is not None else 0.0
-                ctx_seq.append(self.build_full_vector_from_instance(inst))
-
-        for t in range(horizon):
-            x = np.asarray(ctx_seq[t]).reshape(-1)
-            actions = agent.act(x, n_actions=n_actions)
-            try:
-                probas = self.estimate_thompson_probas(x, B=propensity_mc)
-            except Exception:
-                probas = {a: 1.0 / len(arms) for a in arms}
-            for a in actions:
-                p_b = max(probas.get(a, 0.0), 1e-12)
-                # IMPORTANT: pass generator_fn so trace depends on context (like main.py)
-                trace = self.env.step(a, t, n_samples=1, context=x, generator_fn=self._generate_trace_for_arm)
-                trace = np.atleast_2d(trace)
-                r = float(1.0 + trace.sum())
-                entry = SimpleLoggedStep(x=x.copy(), a=a, r=r, p_b=p_b, t=t, ctx_id=None)
-                logged_run.append(entry)
-                try:
-                    agent.update(a, trace, x)
-                except Exception:
+                    bel = agent.beliefs[a]
                     try:
-                        agent.beliefs[a].update(trace, t)
-                        agent.models[a].update(x, r)
+                        if getattr(bel, "has_new_obs", False) or getattr(bel, "t_post", None) != getattr(agent, "t", None):
+                            bel.compute_posterior(getattr(agent, "t", 0))
                     except Exception:
                         pass
-            agent.step()
-            # Context-dependent oracle reward for regret
-            try:
-                true_rewards = np.array([self.expected_reward_for_arm(a, x) for a in actions])
-                r_opt = max(self.expected_reward_for_arm(a, x) for a in arms)
-            except Exception:
-                true_rewards = np.zeros(len(actions), dtype=float)
-                r_opt = 0.0
-            regrets.append(float(np.mean(r_opt - true_rewards)))
-            _, counts = np.unique(actions, return_counts=True)
-            probs = counts / counts.sum()
-            entropies.append(float(-np.sum(probs * np.log(probs + 1e-12))))
-        self.logged.extend(logged_run)
-        return np.array(regrets), np.array(entropies), logged_run
+                    pb_mean = float(getattr(bel, "mean", 0.0))
+                except Exception:
+                    pb_mean = 0.0
+                val = pred + float(getattr(agent, "pb_weight", 0.0)) * pb_mean
+                if val > best_val:
+                    best_val = val
+                    best_arm = a
+            return best_arm
+        return eval_action_fn
 
-    def simulate_trials(self, n_trials: int = 3, horizon: int = 180, n_actions: int = 3, propensity_mc: int = 500, selected_instance_ids: Optional[List[int]] = None, context_mode: str = "random") -> Dict[str, Any]:
-        all_regrets = []
-        for i in range(n_trials):
-            self.agent = None
-            reg, ent, logs = self.simulate_and_log(horizon=horizon, n_actions=n_actions, propensity_mc=propensity_mc, selected_instance_ids=selected_instance_ids, context_mode=context_mode, fresh_agent=True)
-            all_regrets.append(reg)
-        arr = np.vstack(all_regrets)
-        xs = np.arange(1, arr.shape[1] + 1)
-        cumavg = np.cumsum(arr, axis=1) / xs
-        mean = np.mean(cumavg, axis=0)
-        std = np.std(cumavg, axis=0)
-        return {"regrets": arr, "cumavg_mean": mean, "cumavg_std": std}
+    eval_fn = make_eval_fn(v["trained_agent"])
 
-    def compute_ope(self, eval_agent=None, clip=10.0, snips=True, n_boot: int = 200):
-        if len(self.logged) == 0:
-            raise RuntimeError("No logged data available")
-        dataset = self.logged
-        arms = list(self.env.dists.keys()) if self.env is not None else list(self.agent.arms)
-        dm_model = DirectMethodModel(arms=arms, dim=self.context_dim + 1, alpha=1.0, sigma2=self.sigma2)
-        dm_model.fit(dataset)
-        if eval_agent is None:
-            eval_agent = self.agent
-        def eval_action_fn(x):
-            x = np.asarray(x).reshape(-1)
-            return self.greedy_action(x, n_actions=1)[0]
-        metrics = evaluate_offline(dataset=dataset, arms=arms, eval_action_fn=eval_action_fn, dm_model=dm_model, clip=clip, snips=snips, n_boot=n_boot)
-        return metrics
+    metrics = evaluate_offline(
+        dataset=logged_dataset,
+        arms=arms,
+        eval_action_fn=eval_fn,
+        dm_model=dm_model,
+        clip=10.0,
+        snips=True,
+        n_boot=500,
+    )
 
-#app.py
+    print(f"\n--- OPE for {name} ---")
+    for k, m in metrics.items():
+        if k != "diagnostics":
+            print(f"{name} | {k}: {m['value']:.4f} (boot mean {m['boot_mean']:.4f} CI95 {m['ci95'][0]:.4f}..{m['ci95'][1]:.4f})")
+    diag = metrics.get("diagnostics", {})
+    print(f"{name} | diagnostics: coverage={diag.get('coverage', np.nan):.3f}, ESS={diag.get('ess', np.nan):.1f}, avg_wt={diag.get('avg_weight', np.nan):.3f}")
 
-"""
-app.py - Streamlit Admin Console (feature-pool + context instances)
+# -------------------------------
+# Save summary results
+# -------------------------------
+with open(OUTPUT_DIR / "experiment_results.pkl", "wb") as fh:
+    pickle.dump(results, fh)
+print("Saved experiment summary to", OUTPUT_DIR / "experiment_results.pkl")
 
-Run:
-    streamlit run app.py
-
-This UI:
- - shows canonical feature pool and allows admin to select which features to use
- - allows admin to generate or add context instances (instances contain values for a subset of features)
- - supports predicting (greedy or stochastic) for selected instances
- - runs multi-trial simulation using selected instances and plots average cumulative-regret ± std
- - computes OPE on the in-memory logged data
-"""
-
-import os
-import streamlit as st
-import pandas as pd
-import matplotlib.pyplot as plt
-import numpy as np
-import json
-from typing import List, Dict, Any
-
-from model_service import ModelService, FEATURE_GENERATORS
-
-st.set_page_config(layout="wide", page_title="Contextual Bandit Admin")
-
-# init service
-if "svc" not in st.session_state:
-    st.session_state["svc"] = ModelService()
-svc: ModelService = st.session_state["svc"]
-
-st.title("Contextual Bandit — Admin Console (Feature-Pool)")
-
-# layout
-left, right = st.columns([2, 3])
-
-# -----------------------
-# Left panel: feature pool & contexts
-# -----------------------
-with left:
-    st.header("Feature pool")
-    fp = svc.get_feature_pool()
-    # display features with checkboxes
-    st.write("Select which features should be used by the model when building context vectors.")
-    feature_names = [f["name"] for f in fp]
-    # default selected are svc.selected_features
-    selected = st.multiselect("Select features (order is canonical; selected subset will be used)", feature_names, default=svc.get_selected_features())
-    if st.button("Apply selected features"):
-        try:
-            svc.set_selected_features(selected)
-            st.success(f"Selected features set: {svc.get_selected_features()}")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Failed to set selected features: {e}")
-
-    st.markdown("---")
-    st.header("Context instances (user examples)")
-    st.write("Instances are user feature dictionaries. They need only include values for selected features; missing features are filled with 0.")
-
-    # list existing instances
-    insts = svc.get_context_instances()
-    if len(insts) == 0:
-        st.info("No context instances yet. Generate some using the button below or add manually.")
-    else:
-        # show as table of selected features
-        show_cols = svc.get_selected_features()
-        table_rows = []
-        for i, inst in enumerate(insts):
-            row = {"id": i}
-            for f in show_cols:
-                row[f] = inst.get(f, None)
-            table_rows.append(row)
-        st.table(pd.DataFrame(table_rows).fillna(""))
-
-    st.markdown("### Add / Generate instances")
-    with st.form("add_instance_form"):
-        st.write("Provide values for selected features (leave blank to use generator default).")
-        new_values = {}
-        for f in svc.get_selected_features():
-            gen = FEATURE_GENERATORS.get(f)
-            if gen is not None:
-                default = gen(svc.rng)
-            else:
-                default = 0.0
-            # choose input type
-            if isinstance(default, (int, np.integer)) and default in (0, 1):
-                val = st.selectbox(f"{f}", options=[0, 1], index=int(default == 1))
-            else:
-                val = st.number_input(f"{f}", value=float(default))
-            new_values[f] = val
-        add_inst = st.form_submit_button("Add instance")
-    if add_inst:
-        try:
-            idx = svc.add_context_instance(new_values)
-            st.success(f"Added instance id {idx}")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Failed to add instance: {e}")
-
-    if st.button("Generate random instances (5)"):
-        ids = svc.generate_random_instances(5)
-        st.success(f"Generated instances: {ids}")
-        st.rerun()
-
-    # optional: remove last
-    if st.button("Remove last instance"):
-        if len(svc.context_instances) > 0:
-            svc.remove_context_instance(len(svc.context_instances) - 1)
-            st.success("Removed last instance")
-            st.rerun()
-        else:
-            st.info("No instances to remove.")
-
-    st.markdown("---")
-    st.header("Agent management")
-    data_dir = "data"
-    if not os.path.exists(data_dir):
-        os.makedirs(data_dir, exist_ok=True)
-
-    saved_agents = [f for f in os.listdir(data_dir) if f.endswith(".pkl")]
-    saved_agents = sorted(saved_agents)
-    sel_agent = st.selectbox("Load agent (pickle)", ["-- none --"] + saved_agents)
-    if st.button("Load selected agent"):
-        if sel_agent == "-- none --":
-            st.warning("Choose an agent file first.")
-        else:
-            try:
-                svc.load_agent(os.path.join(data_dir, sel_agent))
-                st.success(f"Loaded agent {sel_agent}")
-            except Exception as e:
-                st.error(f"Failed to load: {e}")
-
-    if st.button("Create fresh Progressive agent"):
-        try:
-            svc.create_fresh_agent()
-            st.success("Created fresh Progressive agent.")
-        except Exception as e:
-            st.error(f"Failed to create agent: {e}")
-
-    if st.button("Save current agent to data/trained_agent_ui.pkl"):
-        try:
-            svc.save_agent(os.path.join(data_dir, "trained_agent_ui.pkl"))
-            st.success("Saved agent")
-        except Exception as e:
-            st.error(f"Failed to save agent: {e}")
-
-# -----------------------
-# Right panel: predict, simulate, OPE
-# -----------------------
-with right:
-    st.header("Prediction (selected instances)")
-    n_actions = st.number_input("n_actions (per instance)", min_value=1, max_value=20, value=3)
-    stochastic = st.checkbox("Stochastic (Thompson) sampling", value=False)
-
-    inst_options = [f"{i}: " + ", ".join(f"{k}={v}" for k, v in inst.items()) for i, inst in enumerate(svc.get_context_instances())]
-    selected_instances = st.multiselect("Select instances to predict for", inst_options, default=inst_options[:3] if len(inst_options) >= 3 else inst_options)
-
-    selected_instance_ids = []
-    for s in selected_instances:
-        try:
-            selected_instance_ids.append(int(s.split(":")[0]))
-        except Exception:
-            pass
-
-    if st.button("Predict for selected instances"):
-        if len(selected_instance_ids) == 0:
-            st.warning("Select at least one instance")
-        else:
-            rows = []
-            for iid in selected_instance_ids:
-                try:
-                    act = svc.predict(instance_id=iid, n_actions=n_actions, stochastic=stochastic)
-                    rows.append({"instance_id": iid, "actions": act})
-                except Exception as e:
-                    rows.append({"instance_id": iid, "actions": str(e)})
-            st.table(pd.DataFrame(rows))
-
-    st.markdown("---")
-    st.header("Simulation & Regret")
-    sim_horizon = st.number_input("horizon (rounds)", min_value=10, max_value=1000, value=60)
-    sim_trials = st.number_input("n_trials", min_value=1, max_value=50, value=3)
-    sim_mode = st.selectbox("context sampling mode", options=["random", "round-robin"], index=0)
-    # choose whether to use selected instances
-    use_selected_instances = st.checkbox("Use selected instances for simulation (if none selected, will sample from instance pool or generate from selected features)", value=True)
-
-    run_sim = st.button("Run simulation & show regret")
-    if run_sim:
-        try:
-            if use_selected_instances and len(selected_instance_ids) == 0:
-                st.warning("You selected to use instances but none are selected; using all instances in pool if available.")
-                selected_instance_ids = list(range(len(svc.context_instances)))
-            # run
-            with st.spinner("Running simulations..."):
-                res = svc.simulate_trials(n_trials=int(sim_trials), horizon=int(sim_horizon), n_actions=int(n_actions), propensity_mc=300, selected_instance_ids=(selected_instance_ids if len(selected_instance_ids) > 0 else None), context_mode=sim_mode)
-            mean_curve = np.asarray(res["cumavg_mean"])
-            std_curve = np.asarray(res["cumavg_std"])
-            xs = np.arange(1, mean_curve.size + 1)
-            fig, ax = plt.subplots(figsize=(10, 4))
-            ax.plot(xs, mean_curve, label="mean cumulative-average regret")
-            ax.fill_between(xs, mean_curve - std_curve, mean_curve + std_curve, alpha=0.12)
-            ax.set_xlabel("Round")
-            ax.set_ylabel("Average cumulative regret")
-            ax.set_title(f"Mean ± std over {sim_trials} trials")
-            ax.grid(alpha=0.3)
-            st.pyplot(fig)
-            st.success("Simulation complete (logs appended to in-memory buffer).")
-        except Exception as e:
-            st.error(f"Simulation failed: {e}")
-
-    st.markdown("---")
-    st.header("Offline Policy Evaluation (OPE)")
-    if st.button("Compute OPE (DR/IPS/DM)"):
-        if len(svc.logged) == 0:
-            st.warning("No logged data available. Run simulation first or add logs via /update_batch.")
-        else:
-            try:
-                with st.spinner("Computing OPE (bootstrap): this may take some time..."):
-                    metrics = svc.compute_ope(n_boot=200)
-                st.json(metrics)
-            except Exception as e:
-                st.error(f"OPE failed: {e}")
-
-    st.markdown("---")
-    st.header("Recent logged interactions (preview last 50)")
-    if len(svc.logged) == 0:
-        st.write("No logged interactions yet.")
-    else:
-        preview = []
-        for e in svc.logged[-50:]:
-            preview.append({"t": e.t, "a": e.a, "r": e.r, "p_b": e.p_b, "ctx_id": e.ctx_id})
-        st.table(pd.DataFrame(preview))
-
-st.markdown("---")
-st.write(
-    """
-Notes:
- - "Selected features" controls which fields the admin will provide per-instance.
- - Context vectors are built in a canonical order (defined in the service) and padded/truncated to match the model's expected dimension.
- - Use "Generate random instances" to create sample user contexts for quick testing.
-"""
-)
-
-# api.py
-
-"""
-api.py - FastAPI endpoints for the ModelService with feature-pool and context-instance support.
-
-Run:
-    uvicorn api:app --reload
-"""
-
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import List, Optional, Any, Dict
-import uvicorn
-
-from model_service import ModelService
-
-app = FastAPI(title="ContextualBanditModelAPI")
-svc = ModelService()
-
-# -------------------------
-# Request models
-# -------------------------
-class SelectFeaturesReq(BaseModel):
-    features: List[str]
-
-class InstanceReq(BaseModel):
-    instance: Dict[str, Any]
-
-class MultipleInstancesReq(BaseModel):
-    instances: List[Dict[str, Any]]
-
-class PredictInstanceReq(BaseModel):
-    instance_id: Optional[int] = None
-    instance: Optional[Dict[str, Any]] = None
-    n_actions: Optional[int] = 1
-    stochastic: Optional[bool] = False
-
-class SimulateReq(BaseModel):
-    instance_ids: Optional[List[int]] = None
-    horizon: Optional[int] = 60
-    n_actions: Optional[int] = 3
-    n_trials: Optional[int] = 3
-    context_mode: Optional[str] = "random"
-    propensity_mc: Optional[int] = 500
-
-class UpdateEntry(BaseModel):
-    a: Any
-    trace: List[int]
-    context: Optional[Dict[str, Any]] = None
-    instance_id: Optional[int] = None
-    t: Optional[int] = None
-    p_b: Optional[float] = 0.0
-
-class UpdateBatchReq(BaseModel):
-    updates: List[UpdateEntry]
-
-# -------------------------
-# Endpoints
-# -------------------------
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-@app.get("/features")
-def get_features():
-    try:
-        return {"features": svc.get_feature_pool(), "selected": svc.get_selected_features()}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/select_features")
-def set_selected_features(req: SelectFeaturesReq):
-    try:
-        svc.set_selected_features(req.features)
-        return {"selected": svc.get_selected_features()}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.get("/instances")
-def get_instances():
-    try:
-        return {"instances": svc.get_context_instances()}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/instances")
-def add_instance(req: InstanceReq):
-    try:
-        idx = svc.add_context_instance(req.instance)
-        return {"instance_id": idx}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.post("/generate_instances")
-def generate_instances(n: int = 5):
-    try:
-        ids = svc.generate_random_instances(n=n)
-        return {"added_ids": ids}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.post("/predict_instance")
-def predict_instance(req: PredictInstanceReq):
-    try:
-        if req.instance_id is not None:
-            actions = svc.predict(instance_id=req.instance_id, n_actions=req.n_actions, stochastic=req.stochastic)
-        elif req.instance is not None:
-            actions = svc.predict(instance=req.instance, n_actions=req.n_actions, stochastic=req.stochastic)
-        else:
-            actions = svc.predict(n_actions=req.n_actions, stochastic=req.stochastic)
-        return {"actions": actions}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.post("/simulate")
-def simulate(req: SimulateReq):
-    try:
-        res = svc.simulate_trials(n_trials=req.n_trials, horizon=req.horizon, n_actions=req.n_actions, propensity_mc=req.propensity_mc, selected_instance_ids=req.instance_ids, context_mode=req.context_mode)
-        return {
-            "cumavg_mean": res["cumavg_mean"].tolist(),
-            "cumavg_std": res["cumavg_std"].tolist(),
-            "regrets_shape": list(res["regrets"].shape),
-        }
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.post("/update_batch")
-def update_batch(req: UpdateBatchReq):
-    try:
-        updates = [u.dict() for u in req.updates]
-        n = svc.batch_update(updates, log=True)
-        return {"updated": n}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.get("/ope")
-def ope(n_boot: int = 200):
-    try:
-        metrics = svc.compute_ope(n_boot=n_boot)
-        return metrics
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-# dev-run
-if __name__ == "__main__":
-    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)
-
-
+print("DONE.")
