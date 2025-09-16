@@ -1,58 +1,69 @@
-obsolete, it will be ignored, please remove it to avoid potential confusion 
-[+] Building 101.5s (12/18)                                                                                                             docker:default
- => [obd_worker internal] load build definition from dockerfile                                                                                   0.0s
- => => transferring dockerfile: 487B                                                                                                              0.0s
- => [data_gen internal] load build definition from dockerfile                                                                                     0.0s
- => => transferring dockerfile: 487B                                                                                                              0.0s
- => [obd_worker internal] load metadata for docker.io/library/python:3.10-slim                                                                    2.1s
- => [data_gen internal] load .dockerignore                                                                                                        0.0s
- => => transferring context: 2B                                                                                                                   0.0s
- => [obd_worker internal] load .dockerignore                                                                                                      0.0s
- => => transferring context: 2B                                                                                                                   0.0s
- => [obd_worker internal] load build context                                                                                                     94.9s
- => => transferring context: 8.75GB                                                                                                              94.4s
- => [data_gen 1/7] FROM docker.io/library/python:3.10-slim@sha256:f8081b61393cc16b2339d377bb523a5646cdd28fc6105612b3893c405d27f730                0.0s
- => CACHED [data_gen 2/7] WORKDIR /app                                                                                                            0.0s
- => [obd_worker 3/7] RUN apt-get update && apt-get install -y     build-essential     gfortran     curl     && rm -rf /var/lib/apt/lists/*       33.0s
- => [data_gen internal] load build context                                                                                                       94.9s
- => => transferring context: 8.75GB                                                                                                              94.3s
- => [data_gen 4/7] COPY requirements.txt .                                                                                                        0.7s 
- => ERROR [obd_worker 5/7] RUN pip install --no-cache-dir -r requirements.txt                                                                     3.7s 
-------
- > [obd_worker 5/7] RUN pip install --no-cache-dir -r requirements.txt:
-2.016 Collecting altair==5.5.0
-2.139   Downloading altair-5.5.0-py3-none-any.whl (731 kB)
-2.181      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 731.2/731.2 kB 21.0 MB/s eta 0:00:00
-2.232 Collecting annotated-types==0.7.0
-2.243   Downloading annotated_types-0.7.0-py3-none-any.whl (13 kB)
-2.307 Collecting anyio==4.10.0
-2.317   Downloading anyio-4.10.0-py3-none-any.whl (107 kB)
-2.350      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 107.2/107.2 kB 3.6 MB/s eta 0:00:00
-2.400 Collecting asttokens==3.0.0
-2.410   Downloading asttokens-3.0.0-py3-none-any.whl (26 kB)
-2.463 Collecting attrs==25.3.0
-2.473   Downloading attrs-25.3.0-py3-none-any.whl (63 kB)
-2.487      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 63.8/63.8 kB 6.1 MB/s eta 0:00:00
-2.532 Collecting blinker==1.9.0
-2.543   Downloading blinker-1.9.0-py3-none-any.whl (8.5 kB)
-2.589 Collecting cachetools==6.2.0
-2.598   Downloading cachetools-6.2.0-py3-none-any.whl (11 kB)
-2.656 Collecting certifi==2025.8.3
-2.666   Downloading certifi-2025.8.3-py3-none-any.whl (161 kB)
-2.675      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 161.2/161.2 kB 26.9 MB/s eta 0:00:00
-2.929 Collecting charset-normalizer==3.4.3
-2.939   Downloading charset_normalizer-3.4.3-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (152 kB)
-2.946      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 152.4/152.4 kB 41.8 MB/s eta 0:00:00
-3.003 Collecting click==8.2.1
-3.014   Downloading click-8.2.1-py3-none-any.whl (102 kB)
-3.021      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 102.2/102.2 kB 103.0 MB/s eta 0:00:00
-3.062 Collecting comm==0.2.3
-3.072   Downloading comm-0.2.3-py3-none-any.whl (7.3 kB)
-3.279 ERROR: Ignored the following versions that require a different python version: 1.3.3 Requires-Python >=3.11
-3.279 ERROR: Could not find a version that satisfies the requirement contourpy==1.3.3 (from versions: 0.0.1, 0.0.2, 0.0.3, 0.0.4, 0.0.5, 1.0.0, 1.0.1, 1.0.2, 1.0.3, 1.0.4, 1.0.5, 1.0.6, 1.0.7, 1.1.0, 1.1.1rc1, 1.1.1, 1.2.0, 1.2.1rc1, 1.2.1, 1.3.0, 1.3.1, 1.3.2)
-3.279 ERROR: No matching distribution found for contourpy==1.3.3
-3.486 
-3.486 [notice] A new release of pip is available: 23.0.1 -> 25.2
-3.486 [notice] To update, run: pip install --upgrade pip
-------
-failed to solve: process "/bin/sh -c pip install --no-cache-dir -r requirements.txt" did not complete successfully: exit code: 1
+Attaching to bandit_data_gen, bandit_main_worker, bandit_obd_worker, bandit_streamlit
+bandit_main_worker  | bash: line 1: ./wait_for_synthetic.sh: Permission denied
+bandit_main_worker exited with code 126
+bandit_streamlit    | bash: line 1: ./wait_for_synthetic.sh: Permission denied
+bandit_streamlit exited with code 0
+bandit_streamlit    | bash: line 1: ./wait_for_synthetic.sh: Permission denied
+bandit_streamlit    | bash: line 1: ./wait_for_synthetic.sh: Permission denied
+bandit_streamlit    | bash: line 1: ./wait_for_synthetic.sh: Permission denied
+bandit_obd_worker   | Downloading / loading Open Bandit Dataset (policy=random, campaign=all) ...
+bandit_streamlit    | bash: line 1: ./wait_for_synthetic.sh: Permission denied
+bandit_obd_worker   | Loaded dataset; n_rounds: 10000
+bandit_obd_worker   | Raw df rows: 10000 unique items: 80
+bandit_obd_worker   | Constructing per-item traces (this can take some minutes)...
+bandit_obd_worker   | Selected top 80 items by impression count.
+bandit_streamlit    | bash: line 1: ./wait_for_synthetic.sh: Permission denied
+bandit_streamlit    | bash: line 1: ./wait_for_synthetic.sh: Permission denied
+items: 100%|██████████| 80/80 [00:06<00:00, 11.49it/s]
+bandit_obd_worker   | Constructed empirical traces for 80 items (min required 50).
+bandit_obd_worker   | Estimating priors from empirical traces (StickinessHelper)...
+bandit_obd_worker   | Prior mean vector length: 30 expected w: 30
+bandit_obd_worker   | Building EmpiricalDistribution objects for simulation environment...
+bandit_obd_worker   | Using 80 items for simulation.
+bandit_obd_worker   | Using dataset-supplied contexts, shape: (10000, 20)
+bandit_obd_worker   | === Running trials for policy: Progressive pb_weight: 0.6
+bandit_streamlit    | bash: line 1: ./wait_for_synthetic.sh: Permission denied
+bandit_data_gen exited with code 0
+bandit_streamlit    | bash: line 1: ./wait_for_synthetic.sh: Permission denied
+bandit_obd_worker   | /app/impatient_bandits/data.py:38: UserWarning: sampled more user traces than available
+bandit_obd_worker   |   warnings.warn("sampled more user traces than available")
+bandit_streamlit    | bash: line 1: ./wait_for_synthetic.sh: Permission denied
+bandit_obd_worker   | ...
+bandit_obd_worker   | Saved agent: data/trained_agent_Progressive_n3.pkl
+bandit_obd_worker   | === Running trials for policy: ContextOnly pb_weight: 0.0
+bandit_obd_worker   | ...
+bandit_obd_worker   | Saved agent: data/trained_agent_ContextOnly_n3.pkl
+bandit_obd_worker   | === Running trials for policy: Dummy pb_weight: 0.0
+bandit_streamlit    | bash: line 1: ./wait_for_synthetic.sh: Permission denied
+bandit_obd_worker   | ...
+bandit_obd_worker   | Saved agent: data/trained_agent_Dummy_n3.pkl
+bandit_obd_worker   | 
+bandit_obd_worker   | === Offline Policy Evaluation (OPE) summaries ===
+bandit_obd_worker   | 
+bandit_obd_worker   | --- OPE for Progressive ---
+bandit_obd_worker   | Progressive | IPS: 1.7928 (boot mean 1.7712 CI95 1.2994..2.2618)
+bandit_obd_worker   | Progressive | SNIPS: 3.8027 (boot mean 3.7886 CI95 3.4546..4.1659)
+bandit_obd_worker   | Progressive | DM: 3.6188 (boot mean 3.6177 CI95 3.5943..3.6397)
+bandit_obd_worker   | Progressive | DR: 3.7153 (boot mean 3.7106 CI95 3.5723..3.8818)
+bandit_obd_worker   | Progressive | diagnostics: coverage=0.213, ESS=59.6, avg_wt=0.471
+bandit_obd_worker   | 
+bandit_obd_worker   | --- OPE for ContextOnly ---
+bandit_obd_worker   | ContextOnly | IPS: 3.3190 (boot mean 3.3252 CI95 2.8474..3.9100)
+bandit_obd_worker   | ContextOnly | SNIPS: 3.6610 (boot mean 3.6642 CI95 3.4772..3.8642)
+bandit_obd_worker   | ContextOnly | DM: 3.6314 (boot mean 3.6312 CI95 3.6204..3.6425)
+bandit_obd_worker   | ContextOnly | DR: 3.6561 (boot mean 3.6594 CI95 3.4950..3.8374)
+bandit_obd_worker   | ContextOnly | diagnostics: coverage=0.402, ESS=131.1, avg_wt=0.907
+bandit_obd_worker   | 
+bandit_obd_worker   | --- OPE for Dummy ---
+bandit_obd_worker   | Dummy | IPS: 1.1580 (boot mean 1.1573 CI95 0.6256..1.7983)
+bandit_obd_worker   | Dummy | SNIPS: 4.2352 (boot mean 4.2285 CI95 3.6381..4.8248)
+bandit_obd_worker   | Dummy | DM: 3.7781 (boot mean 3.7781 CI95 3.7583..3.8015)
+bandit_obd_worker   | Dummy | DR: 3.8631 (boot mean 3.8628 CI95 3.7128..4.0238)
+bandit_obd_worker   | Dummy | diagnostics: coverage=0.063, ESS=20.6, avg_wt=0.273
+bandit_obd_worker   | Saved experiment summary to data/experiment_results.pkl
+bandit_obd_worker   | DONE.
+bandit_obd_worker exited with code 0
+bandit_streamlit    | bash: line 1: ./wait_for_synthetic.sh: Permission denied
+bandit_streamlit    | bash: line 1: ./wait_for_synthetic.sh: Permission denied
+bandit_streamlit    | bash: line 1: ./wait_for_synthetic.sh: Permission denied
+bandit_streamlit    | bash: line 1: ./wait_for_synthetic.sh: Permission denied
